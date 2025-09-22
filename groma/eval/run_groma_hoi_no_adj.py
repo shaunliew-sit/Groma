@@ -295,9 +295,31 @@ class POSBasedHOIExtractorNoAdj:
 
     def _map_to_swig_id(self, action, object_text):
         """Map to SWIG HOI ID using action and object IDs"""
-        # This would require additional mapping logic for SWIG
-        # For now, return None as SWIG mapping is more complex
-        return None
+        # Normalize inputs
+        action_normalized = self._normalize_action_for_swig(action)
+        object_normalized = self._normalize_object_for_swig(object_text)
+        
+        # Find action ID
+        action_id = self._find_swig_action_id(action_normalized)
+        if action_id is None:
+            print(f"WARNING: Could not find SWIG action_id for '{action}' (normalized: '{action_normalized}')")
+            return None
+            
+        # Find object ID
+        object_id = self._find_swig_object_id(object_normalized)
+        if object_id is None:
+            print(f"WARNING: Could not find SWIG object_id for '{object_text}' (normalized: '{object_normalized}')")
+            return None
+        
+        # Look up HOI ID using (action_id, object_id) pair
+        hoi_key = (action_id, object_id)
+        if hoi_key in self.swig_hoi_mapper:
+            hoi_id = self.swig_hoi_mapper[hoi_key]
+            print(f"DEBUG: Mapped ({action}, {object_text}) -> (action_id={action_id}, object_id={object_id}) -> hoi_id={hoi_id}")
+            return hoi_id
+        else:
+            print(f"WARNING: No SWIG HOI mapping found for (action_id={action_id}, object_id={object_id})")
+            return None
 
     def _normalize_action(self, action):
         """Normalize action names to match standard vocabularies"""
@@ -357,6 +379,160 @@ class POSBasedHOIExtractorNoAdj:
         }
 
         return object_mappings.get(object_text, object_text)
+
+    def _normalize_action_for_swig(self, action):
+        """Normalize action names for SWIG mapping"""
+        action = action.lower().strip()
+        
+        # Remove common suffixes
+        if action.endswith('ing'):
+            action = action[:-3]
+        
+        # Enhanced action mappings for SWIG with semantic relationships
+        action_mappings = {
+            # Basic actions
+            'hold': 'holding',
+            'sit': 'sitting',
+            'stand': 'standing',
+            'ride': 'riding',
+            'play': 'playing',
+            'eat': 'eating',
+            'drink': 'drinking',
+            'use': 'using',
+            'wear': 'wearing',
+            'carry': 'carrying',
+            'throw': 'throwing',
+            'catch': 'catching',
+            'hit': 'hitting',
+            'kick': 'kicking',
+            'touch': 'touching',
+            'read': 'reading',
+            'look': 'looking',
+            'watch': 'watching',
+            'listen': 'listening',
+            
+            # Semantic mappings for common cases
+            'get': 'tattooing',  # "getting a tattoo" -> "tattooing"
+            'receive': 'tattooing',  # "receiving a tattoo" -> "tattooing"
+            'give': 'tattooing',  # "giving a tattoo" -> "tattooing"
+            'apply': 'tattooing',  # "applying tattoo" -> "tattooing"
+            'draw': 'tattooing',  # "drawing tattoo" -> "tattooing"
+            'mark': 'tattooing',  # "marking skin" -> "tattooing"
+        }
+        
+        return action_mappings.get(action, action)
+
+    def _normalize_object_for_swig(self, object_text):
+        """Normalize object names for SWIG mapping"""
+        object_text = object_text.lower().strip()
+        
+        # Enhanced object mappings for SWIG with semantic relationships
+        object_mappings = {
+            # Basic objects
+            'phone': 'cell phone',
+            'cellphone': 'cell phone',
+            'mobile': 'cell phone',
+            'racket': 'tennis racket',
+            'racquet': 'tennis racket',
+            'bat': 'baseball bat',
+            'bike': 'bicycle',
+            'motorcycle': 'motorbike',
+            'tv': 'television',
+            'television': 'television',
+            'computer': 'laptop',
+            'laptop': 'laptop',
+            'car': 'car',
+            'automobile': 'car',
+            'chair': 'chair',
+            'seat': 'chair',
+            
+            # Semantic mappings for tattoo context
+            'tattoo': 'needle',  # "getting a tattoo" -> object is "needle" (tool used)
+            'arm': 'needle',     # "tattoo on arm" -> object is "needle" (tool)
+            'skin': 'needle',    # "tattoo on skin" -> object is "needle" (tool)
+            'body': 'needle',    # "tattoo on body" -> object is "needle" (tool)
+            'leg': 'needle',     # "tattoo on leg" -> object is "needle" (tool)
+            'back': 'needle',    # "tattoo on back" -> object is "needle" (tool)
+            
+            # Person-related mappings
+            'woman': 'person',
+            'man': 'person',
+            'girl': 'person',
+            'boy': 'person',
+            'child': 'person',
+            'adult': 'person',
+            'individual': 'person',
+            'someone': 'person',
+            'another person': 'person',
+        }
+        
+        return object_mappings.get(object_text, object_text)
+
+    def _find_swig_action_id(self, action_name):
+        """Find SWIG action ID by name"""
+        from groma.eval.hoi_eval.swig_v1_categories import SWIG_ACTIONS
+        
+        # Direct name match
+        for action in SWIG_ACTIONS:
+            if action['name'] == action_name:
+                print(f"DEBUG: Direct action match: '{action_name}' -> action_id {action['id']}")
+                return action['id']
+        
+        # Fuzzy matching with word-level comparison
+        action_words = set(action_name.split())
+        for action in SWIG_ACTIONS:
+            action_name_words = set(action['name'].split())
+            if action_words and action_name_words:
+                # Check for word overlap
+                overlap = len(action_words.intersection(action_name_words))
+                if overlap > 0:
+                    print(f"DEBUG: Fuzzy action match: '{action_name}' -> '{action['name']}' (action_id {action['id']})")
+                    return action['id']
+        
+        # Partial string matching as fallback
+        for action in SWIG_ACTIONS:
+            if action_name in action['name'] or action['name'] in action_name:
+                print(f"DEBUG: Partial action match: '{action_name}' -> '{action['name']}' (action_id {action['id']})")
+                return action['id']
+        
+        print(f"DEBUG: No action match found for '{action_name}'")
+        return None
+
+    def _find_swig_object_id(self, object_name):
+        """Find SWIG object ID by name"""
+        from groma.eval.hoi_eval.swig_v1_categories import SWIG_CATEGORIES
+        
+        # Direct name match
+        for obj in SWIG_CATEGORIES:
+            if obj['name'] == object_name:
+                print(f"DEBUG: Direct object match: '{object_name}' -> object_id {obj['id']}")
+                return obj['id']
+        
+        # Check gloss (synonyms)
+        for obj in SWIG_CATEGORIES:
+            if object_name in obj.get('gloss', []):
+                print(f"DEBUG: Gloss object match: '{object_name}' -> '{obj['name']}' (object_id {obj['id']})")
+                return obj['id']
+        
+        # Fuzzy matching with word-level comparison
+        object_words = set(object_name.split())
+        for obj in SWIG_CATEGORIES:
+            obj_name_words = set(obj['name'].split())
+            if object_words and obj_name_words:
+                # Check for word overlap
+                overlap = len(object_words.intersection(obj_name_words))
+                if overlap > 0:
+                    print(f"DEBUG: Fuzzy object match: '{object_name}' -> '{obj['name']}' (object_id {obj['id']})")
+                    return obj['id']
+        
+        # Partial string matching as fallback
+        for obj in SWIG_CATEGORIES:
+            if object_name in obj['name'] or obj['name'] in object_name:
+                print(f"DEBUG: Partial object match: '{object_name}' -> '{obj['name']}' (object_id {obj['id']})")
+                return obj['id']
+        
+        print(f"DEBUG: No object match found for '{object_name}'")
+        return None
 
     def _fuzzy_match_hico(self, action, object_text):
         """Fuzzy matching for HICO HOI IDs when direct mapping fails"""
@@ -1393,9 +1569,12 @@ class HOIVisualizer:
                 object_label = f"GT-O{i+1}: {gt_hoi['object_name']}"
                 action_label = f"GT: {gt_hoi['action_name']}"
             else:
+                # Use actual names for SWIG instead of IDs
+                action_name = gt_hoi.get('action_name', f"action_{gt_hoi['action_id']}")
+                object_name = gt_hoi.get('object_name', f"object_{gt_hoi['object_id']}")
                 person_label = f"GT-P{i+1}: Person"
-                object_label = f"GT-O{i+1}: Obj{gt_hoi['object_id']}"
-                action_label = f"GT: Act{gt_hoi['action_id']}"
+                object_label = f"GT-O{i+1}: {object_name}"
+                action_label = f"GT: {action_name}"
 
             # Draw person label
             self._draw_label(draw, person_bbox, person_label, gt_colors['person'], font_small)
@@ -1929,32 +2108,58 @@ def extract_swig_ground_truth(gt_data):
     if not gt_data:
         return []
 
-    from groma.eval.hoi_eval.swig_v1_categories import SWIG_INTERACTIONS
+    from groma.eval.hoi_eval.swig_v1_categories import SWIG_INTERACTIONS, SWIG_ACTIONS, SWIG_CATEGORIES
 
     hoi_mapper = {(x["action_id"], x["object_id"]): x["id"] for x in SWIG_INTERACTIONS}
+    
+    # Create ID to name mappings
+    action_id2name = {x["id"]: x["name"] for x in SWIG_ACTIONS}
+    object_id2name = {x["id"]: x["name"] for x in SWIG_CATEGORIES}
 
     gt_hois = []
     box_annos = gt_data.get('box_annotations', [])
     hoi_annos = gt_data.get('hoi_annotations', [])
 
-    for hoi in hoi_annos:
-        person_box = box_annos[hoi["subject_id"]]["bbox"]
-        object_box = box_annos[hoi["object_id"]]["bbox"]
-        action_id = hoi["action_id"]
-        object_id = box_annos[hoi["object_id"]]["category_id"]
+    print(f"DEBUG: Processing {len(hoi_annos)} SWIG HOI annotations")
 
-        hoi_id = hoi_mapper.get((action_id, object_id))
-        if hoi_id is not None:
-            gt_hois.append({
-                'hoi_id': hoi_id,
-                'action_id': action_id,
-                'object_id': object_id,
-                'person_bbox': person_box,
-                'object_bbox': object_box,
-                'subject_id': hoi["subject_id"],
-                'object_id_idx': hoi["object_id"]
-            })
+    for i, hoi in enumerate(hoi_annos):
+        try:
+            person_box = box_annos[hoi["subject_id"]]["bbox"]
+            object_box = box_annos[hoi["object_id"]]["bbox"]
+            action_id = hoi["action_id"]
+            object_id = box_annos[hoi["object_id"]]["category_id"]
 
+            print(f"DEBUG: SWIG HOI {i+1}: action_id={action_id}, object_id={object_id}")
+
+            # Get action and object names
+            action_name = action_id2name.get(action_id, f"action_{action_id}")
+            object_name = object_id2name.get(object_id, f"object_{object_id}")
+
+            print(f"DEBUG: SWIG HOI {i+1}: action_name='{action_name}', object_name='{object_name}'")
+
+            hoi_id = hoi_mapper.get((action_id, object_id))
+            if hoi_id is not None:
+                gt_hois.append({
+                    'hoi_id': hoi_id,
+                    'action_id': action_id,
+                    'object_id': object_id,
+                    'action_name': action_name,
+                    'object_name': object_name,
+                    'person_bbox': person_box,
+                    'object_bbox': object_box,
+                    'subject_id': hoi["subject_id"],
+                    'object_id_idx': hoi["object_id"]
+                })
+                print(f"DEBUG: SWIG HOI {i+1}: hoi_id={hoi_id} for ('{action_name}', '{object_name}')")
+            else:
+                print(f"WARNING: No SWIG HOI mapping found for (action_id={action_id}, object_id={object_id})")
+
+        except Exception as e:
+            print(f"ERROR: Failed to process SWIG HOI annotation {i+1}: {str(e)}")
+            print(f"  HOI data: {hoi}")
+            continue
+
+    print(f"DEBUG: Successfully extracted {len(gt_hois)} valid SWIG HOI annotations")
     return gt_hois
 
 def calculate_single_image_metrics(predictions, gt_hois, image_width, image_height):
@@ -2299,7 +2504,10 @@ def eval_hoi_no_adj_single(args):
                 print(f"  {i}. HOI_ID: {gt_hoi['hoi_id']}, Action: '{gt_hoi['action_name']}', Object: '{gt_hoi['object_name']}'")
                 print(f"     Person bbox: {gt_hoi['person_bbox']}, Object bbox: {gt_hoi['object_bbox']}")
             elif dataset_type == 'swig':
-                print(f"  {i}. HOI_ID: {gt_hoi['hoi_id']}, Action_ID: {gt_hoi['action_id']}, Object_ID: {gt_hoi['object_id']}")
+                # Show both names and IDs for SWIG
+                action_name = gt_hoi.get('action_name', f"action_{gt_hoi['action_id']}")
+                object_name = gt_hoi.get('object_name', f"object_{gt_hoi['object_id']}")
+                print(f"  {i}. HOI_ID: {gt_hoi['hoi_id']}, Action: '{action_name}' (ID: {gt_hoi['action_id']}), Object: '{object_name}' (ID: {gt_hoi['object_id']})")
                 print(f"     Person bbox: {gt_hoi['person_bbox']}, Object bbox: {gt_hoi['object_bbox']}")
         print()
 
@@ -2405,7 +2613,10 @@ def eval_hoi_no_adj_single(args):
                 if dataset_type == 'hico':
                     print(f"  ✅ MATCH: Pred #{pred_idx+1} (HOI_ID: {hoi_id}, Score: {score:.3f}) matches GT #{gt_idx+1} ('{gt_hoi['action_name']}' + '{gt_hoi['object_name']}') with IoU: {match['iou']:.3f}")
                 else:
-                    print(f"  ✅ MATCH: Pred #{pred_idx+1} (HOI_ID: {hoi_id}, Score: {score:.3f}) matches GT #{gt_idx+1} (Action_ID: {gt_hoi['action_id']}, Object_ID: {gt_hoi['object_id']}) with IoU: {match['iou']:.3f}")
+                    # Show both names and IDs for SWIG
+                    action_name = gt_hoi.get('action_name', f"action_{gt_hoi['action_id']}")
+                    object_name = gt_hoi.get('object_name', f"object_{gt_hoi['object_id']}")
+                    print(f"  ✅ MATCH: Pred #{pred_idx+1} (HOI_ID: {hoi_id}, Score: {score:.3f}) matches GT #{gt_idx+1} ('{action_name}' + '{object_name}') with IoU: {match['iou']:.3f}")
             else:
                 print(f"  ❌ NO MATCH: Pred #{pred_idx+1} (HOI_ID: {hoi_id}, Score: {score:.3f}) - no suitable ground truth found")
 
@@ -2419,7 +2630,10 @@ def eval_hoi_no_adj_single(args):
                 if dataset_type == 'hico':
                     print(f"    🎯 GT #{gt_idx+1}: HOI_ID {gt_hoi['hoi_id']} ('{gt_hoi['action_name']}' + '{gt_hoi['object_name']}') - not detected")
                 else:
-                    print(f"    🎯 GT #{gt_idx+1}: HOI_ID {gt_hoi['hoi_id']} (Action_ID: {gt_hoi['action_id']}, Object_ID: {gt_hoi['object_id']}) - not detected")
+                    # Show both names and IDs for SWIG
+                    action_name = gt_hoi.get('action_name', f"action_{gt_hoi['action_id']}")
+                    object_name = gt_hoi.get('object_name', f"object_{gt_hoi['object_id']}")
+                    print(f"    🎯 GT #{gt_idx+1}: HOI_ID {gt_hoi['hoi_id']} ('{action_name}' + '{object_name}') - not detected")
         print()
 
     elif gt_hois and not evaluation_predictions:
