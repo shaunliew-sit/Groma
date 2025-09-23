@@ -322,139 +322,16 @@ class POSBasedHOIExtractorNoAdj:
             return None
 
     def _normalize_action(self, action):
-        """Normalize action names to match standard vocabularies"""
+        """Return original action without static mapping to preserve Groma's generated words"""
         action = action.lower().strip()
-
-        # Common action mappings to HICO action names
-        action_mappings = {
-            'hold': 'hold',
-            'sit': 'sit_on',          # Fixed: sit -> sit_on
-            'sit on': 'sit_on',       # Also handle "sit on" directly
-            'stand': 'stand_on',
-            'stand on': 'stand_on',   # Also handle "stand on" directly
-            'ride': 'ride',
-            'play': 'play',
-            'eat': 'eat',
-            'drink': 'drink',
-            'use': 'use',
-            'wear': 'wear',
-            'carry': 'carry',
-            'throw': 'throw',
-            'catch': 'catch',
-            'hit': 'hit',
-            'kick': 'kick',
-            'touch': 'touch',
-            'read': 'read',
-            'look': 'look_at',
-            'look at': 'look_at',
-            'watch': 'watch',
-            'listen': 'listen_to',
-            'listen to': 'listen_to'
-        }
-
-        return action_mappings.get(action, action)
+        return action
 
     def _normalize_object_for_hico(self, object_text):
-        """Normalize object names to match HICO object vocabulary"""
+        """Normalize object names for HICO mapping - only person mappings preserved"""
         object_text = object_text.lower().strip()
 
-        # Common object mappings to HICO vocabulary
-        object_mappings = {
-            'phone': 'cell phone',
-            'cellphone': 'cell phone',
-            'mobile': 'cell phone',
-            'racket': 'tennis racket',
-            'racquet': 'tennis racket',
-            'bat': 'baseball bat',
-            'bike': 'bicycle',
-            'motorcycle': 'motorbike',
-            'tv': 'tv',
-            'television': 'tv',
-            'computer': 'laptop',
-            'laptop': 'laptop',
-            'car': 'car',
-            'automobile': 'car',
-            'chair': 'chair',
-            'seat': 'chair'
-        }
-
-        return object_mappings.get(object_text, object_text)
-
-    def _normalize_action_for_swig(self, action):
-        """Normalize action names for SWIG mapping"""
-        action = action.lower().strip()
-        
-        # Remove common suffixes
-        if action.endswith('ing'):
-            action = action[:-3]
-        
-        # Enhanced action mappings for SWIG with semantic relationships
-        action_mappings = {
-            # Basic actions
-            'hold': 'holding',
-            'sit': 'sitting',
-            'stand': 'standing',
-            'ride': 'riding',
-            'play': 'playing',
-            'eat': 'eating',
-            'drink': 'drinking',
-            'use': 'using',
-            'wear': 'wearing',
-            'carry': 'carrying',
-            'throw': 'throwing',
-            'catch': 'catching',
-            'hit': 'hitting',
-            'kick': 'kicking',
-            'touch': 'touching',
-            'read': 'reading',
-            'look': 'looking',
-            'watch': 'watching',
-            'listen': 'listening',
-            
-            # Semantic mappings for common cases
-            'get': 'tattooing',  # "getting a tattoo" -> "tattooing"
-            'receive': 'tattooing',  # "receiving a tattoo" -> "tattooing"
-            'give': 'tattooing',  # "giving a tattoo" -> "tattooing"
-            'apply': 'tattooing',  # "applying tattoo" -> "tattooing"
-            'draw': 'tattooing',  # "drawing tattoo" -> "tattooing"
-            'mark': 'tattooing',  # "marking skin" -> "tattooing"
-        }
-        
-        return action_mappings.get(action, action)
-
-    def _normalize_object_for_swig(self, object_text):
-        """Normalize object names for SWIG mapping"""
-        object_text = object_text.lower().strip()
-        
-        # Enhanced object mappings for SWIG with semantic relationships
-        object_mappings = {
-            # Basic objects
-            'phone': 'cell phone',
-            'cellphone': 'cell phone',
-            'mobile': 'cell phone',
-            'racket': 'tennis racket',
-            'racquet': 'tennis racket',
-            'bat': 'baseball bat',
-            'bike': 'bicycle',
-            'motorcycle': 'motorbike',
-            'tv': 'television',
-            'television': 'television',
-            'computer': 'laptop',
-            'laptop': 'laptop',
-            'car': 'car',
-            'automobile': 'car',
-            'chair': 'chair',
-            'seat': 'chair',
-            
-            # Semantic mappings for tattoo context
-            'tattoo': 'needle',  # "getting a tattoo" -> object is "needle" (tool used)
-            'arm': 'needle',     # "tattoo on arm" -> object is "needle" (tool)
-            'skin': 'needle',    # "tattoo on skin" -> object is "needle" (tool)
-            'body': 'needle',    # "tattoo on body" -> object is "needle" (tool)
-            'leg': 'needle',     # "tattoo on leg" -> object is "needle" (tool)
-            'back': 'needle',    # "tattoo on back" -> object is "needle" (tool)
-            
-            # Person-related mappings
+        # Keep only person-related mappings as required for HICO evaluation
+        person_mappings = {
             'woman': 'person',
             'man': 'person',
             'girl': 'person',
@@ -464,9 +341,67 @@ class POSBasedHOIExtractorNoAdj:
             'individual': 'person',
             'someone': 'person',
             'another person': 'person',
+            'kid': 'person',
+            'people': 'person',
+            'human': 'person',
+            'guy': 'person',
+            'lady': 'person',
+            'gentleman': 'person',
+            'player': 'person',
+            'athlete': 'person',
+            'worker': 'person',
+            'student': 'person',
+            'teacher': 'person',
+            'teenager': 'person',
+            'baby': 'person',
+            'male': 'person',
+            'female': 'person',
+            'figure': 'person',
+            'character': 'person'
         }
-        
-        return object_mappings.get(object_text, object_text)
+
+        return person_mappings.get(object_text, object_text)
+
+    def _normalize_action_for_swig(self, action):
+        """Return original action without static mapping to preserve Groma's generated words"""
+        action = action.lower().strip()
+        return action
+
+    def _normalize_object_for_swig(self, object_text):
+        """Normalize object names for SWIG mapping - only person mappings preserved"""
+        object_text = object_text.lower().strip()
+
+        # Keep only person-related mappings as required for SWIG evaluation
+        person_mappings = {
+            'woman': 'person',
+            'man': 'person',
+            'girl': 'person',
+            'boy': 'person',
+            'child': 'person',
+            'adult': 'person',
+            'individual': 'person',
+            'someone': 'person',
+            'another person': 'person',
+            'kid': 'person',
+            'people': 'person',
+            'human': 'person',
+            'guy': 'person',
+            'lady': 'person',
+            'gentleman': 'person',
+            'player': 'person',
+            'athlete': 'person',
+            'worker': 'person',
+            'student': 'person',
+            'teacher': 'person',
+            'teenager': 'person',
+            'baby': 'person',
+            'male': 'person',
+            'female': 'person',
+            'figure': 'person',
+            'character': 'person'
+        }
+
+        return person_mappings.get(object_text, object_text)
 
     def _find_swig_action_id(self, action_name):
         """Find SWIG action ID by name"""
