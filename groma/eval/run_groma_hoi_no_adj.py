@@ -699,9 +699,41 @@ class POSBasedHOIExtractorNoAdj:
 
         return None
 
+    def prepare_visualization_triplets(self, triplets, dataset_type='hico'):
+        """Prepare all triplets for visualization with mapping status"""
+        visualization_triplets = []
+
+        for triplet in triplets:
+            # Create enhanced triplet copy
+            viz_triplet = triplet.copy()
+
+            # Check if action can be mapped to HOI ID
+            action = triplet['action']
+            original_action = triplet.get('original_action', action)
+            object_text = triplet['object']['text']
+
+            hoi_id = self.map_to_hoi_id(action, object_text, dataset_type)
+
+            # Add mapping metadata
+            viz_triplet['mapping_status'] = 'mapped' if hoi_id is not None else 'unmapped'
+            viz_triplet['hoi_id'] = hoi_id
+            viz_triplet['evaluation_eligible'] = hoi_id is not None
+
+            # Add warning message for unmapped actions
+            if hoi_id is None:
+                if original_action != action:
+                    viz_triplet['warning'] = f"Action ({original_action} → {action}, {object_text}) not found in {dataset_type.upper()} dataset"
+                else:
+                    viz_triplet['warning'] = f"Action ({action}, {object_text}) not found in {dataset_type.upper()} dataset"
+
+            visualization_triplets.append(viz_triplet)
+
+        return visualization_triplets
+
     def convert_triplets_to_predictions(self, triplets, image_id, image_width, image_height, dataset_type='hico'):
-        """Convert triplets to evaluation prediction format"""
+        """Convert triplets to evaluation prediction format (only mappable actions)"""
         predictions = []
+        unmapped_count = 0
 
         for triplet in triplets:
             # Action is already normalized in the triplet
@@ -712,10 +744,11 @@ class POSBasedHOIExtractorNoAdj:
             hoi_id = self.map_to_hoi_id(action, object_text, dataset_type)
 
             if hoi_id is None:
+                unmapped_count += 1
                 if original_action != action:
-                    print(f"WARNING: Could not map normalized action ({original_action} → {action}, {object_text}) to HOI ID")
+                    print(f"⚠️  UNMAPPED: Action ({original_action} → {action}, {object_text}) not in {dataset_type.upper()} dataset - skipping evaluation")
                 else:
-                    print(f"WARNING: Could not map action ({action}, {object_text}) to HOI ID")
+                    print(f"⚠️  UNMAPPED: Action ({action}, {object_text}) not in {dataset_type.upper()} dataset - skipping evaluation")
                 continue
 
             # Convert coordinates to absolute pixels
@@ -750,6 +783,12 @@ class POSBasedHOIExtractorNoAdj:
 
             predictions.append(prediction)
 
+        # Report summary
+        total_triplets = len(triplets)
+        mapped_count = len(predictions)
+        if unmapped_count > 0:
+            print(f"📊 Conversion Summary: {mapped_count} evaluable, {unmapped_count} unmappable (total: {total_triplets} triplets)")
+
         return predictions
 
     def _extract_with_pos_spacy(self, text, entities, coordinates_info, dataset_type='hico'):
@@ -781,6 +820,7 @@ class POSBasedHOIExtractorNoAdj:
         sentence_tokens = list(doc)
         for i, token in enumerate(sentence_tokens):
             print(f"  [{i:2}] {token.text:12} {token.lemma_:12} {token.pos_:8} {token.dep_:10}")
+
 
         # Find all VERB tokens (no vocabulary restriction)
         verb_tokens = []
@@ -866,15 +906,17 @@ class POSBasedHOIExtractorNoAdj:
         """Find human subject for a verb using enhanced dependency parsing"""
         print(f"DEBUG: Looking for human subject for verb '{verb_token.text}' (dep: {verb_token.dep_})")
 
-        # Method 1: Direct subject dependency
+        # Method 1: Direct subject dependency with contextual matching
         for child in verb_token.children:
             if child.dep_ in ['nsubj', 'nsubjpass']:
                 print(f"  Found direct subject dependency: '{child.text}' ({child.dep_})")
-                # Match to human entities
-                for human in humans:
-                    if self._text_overlap_enhanced(child.text, human['text']):
-                        print(f"  ✅ Direct subject match: '{human['text']}'")
-                        return human
+
+                # Use enhanced contextual matching for ALL verbs, not just adverbial clauses
+                print(f"  Using enhanced contextual matching for verb '{verb_token.text}' with subject '{child.text}'")
+                contextual_human = self._find_best_human_match(verb_token, child, humans)
+                if contextual_human:
+                    print(f"  ✅ Best contextual match: '{contextual_human['text']}'")
+                    return contextual_human
 
         # Method 2: For adverbial clauses (advcl), determine correct subject
         if verb_token.dep_ == 'advcl':
@@ -961,75 +1003,25 @@ class POSBasedHOIExtractorNoAdj:
                     print(f"  ✅ Inherited subject from coordinated verb: '{coord_subject['text']}'")
                     return coord_subject
 
-        # Method 4: Context-based analysis with improved clause detection
-        sentence = verb_token.sent
-        sentence_tokens = list(sentence)
+        # Method 4: Position-based subject detection using enhanced scoring
+        print(f"  ⚠️ DEPENDENCY PARSING FAILED - Using position-based scoring for verb '{verb_token.text}'")
+
+        # Use the new scoring system for fallback case
+        # Create a dummy subject (the verb itself) for position-based matching
+        dummy_subject = verb_token  # Use verb as subject for position-based scoring
+
+        sentence_tokens = list(verb_token.sent)
         verb_idx = sentence_tokens.index(verb_token)
+        print(f"  Verb '{verb_token.text}' found at position {verb_idx}")
 
-        print(f"  Context search: verb '{verb_token.text}' at position {verb_idx}")
-
-        # Improved clause boundary detection
-        clause_boundaries = self._find_clause_boundaries(sentence_tokens, verb_idx)
-        clause_start, clause_end = clause_boundaries
-
-        print(f"  Clause boundaries: [{clause_start}:{clause_end}] for verb at {verb_idx}")
-
-        # Find the closest human in the same clause, preferring those before the verb
-        best_human = None
-        best_score = -1
-
-        for human in humans:
-            human_words = human['text'].lower().split()
-
-            # Find all positions where this human appears
-            human_positions = []
-            for i, token in enumerate(sentence_tokens):
-                if any(hw in token.text.lower() for hw in human_words):
-                    human_positions.append(i)
-
-            for human_pos in human_positions:
-                # Check if human is in the same clause
-                if clause_start <= human_pos <= clause_end:
-                    # Calculate score: prefer humans before verb, closer is better
-                    if human_pos < verb_idx:
-                        score = 1000 - (verb_idx - human_pos)  # Higher score for closer
-                        print(f"  Human '{human['text']}' at pos {human_pos}: score {score} (before verb)")
-                    else:
-                        score = 100 - (human_pos - verb_idx)   # Lower score for after verb
-                        print(f"  Human '{human['text']}' at pos {human_pos}: score {score} (after verb)")
-
-                    if score > best_score:
-                        best_score = score
-                        best_human = human
-
+        best_human = self._find_best_human_match_position_only(verb_token, verb_idx, sentence_tokens, humans)
         if best_human:
-            print(f"  ✅ Context match: '{best_human['text']}' (score: {best_score})")
+            print(f"  ✅ Position-based fallback match: '{best_human['text']}'")
             return best_human
 
-        print(f"  ❌ No human subject found for '{verb_token.text}'")
-        return None
-
-    def _find_clause_boundaries(self, sentence_tokens, verb_idx):
-        """Find clause boundaries around a verb position"""
-        clause_markers = ['while', 'although', 'though', 'whereas', 'when', 'if', 'because', 'since']
-
-        # Find start of clause (look backwards for clause markers)
-        clause_start = 0
-        for i in range(verb_idx - 1, -1, -1):
-            if sentence_tokens[i].text.lower() in clause_markers:
-                clause_start = i + 1
-                break
-
-        # Find end of clause (look forwards for clause markers, commas, or sentence end)
-        clause_end = len(sentence_tokens) - 1
-        for i in range(verb_idx + 1, len(sentence_tokens)):
-            if (sentence_tokens[i].text.lower() in clause_markers or
-                sentence_tokens[i].text in [',', ';'] or
-                sentence_tokens[i].pos_ == 'PUNCT'):
-                clause_end = i - 1
-                break
-
-        return clause_start, clause_end
+        # Method 5: If everything else fails, return None instead of humans[0]
+        print(f"  ❌ ALL MATCHING METHODS FAILED - No suitable human found for verb '{verb_token.text}'")
+        return None  # Return None instead of humans[0] to avoid wrong assignments
 
     def _analyze_expected_triplets(self, doc, humans, objects):
         """Analyze the sentence to determine expected correct triplets"""
@@ -1069,6 +1061,250 @@ class POSBasedHOIExtractorNoAdj:
         print(f"    Available humans: {[h['text'] for h in humans]}")
         print(f"    Available objects: {[o['text'] for o in objects]}")
         print()
+
+    def _find_contextual_human_for_advcl(self, verb_token, subject_child, humans):
+        """Find the correct human for an adverbial clause by looking at context"""
+        print(f"    DEBUG: Finding contextual human for advcl verb '{verb_token.text}' with subject '{subject_child.text}'")
+
+        # Get sentence tokens and find positions
+        sentence_tokens = list(verb_token.sent)
+        verb_idx = sentence_tokens.index(verb_token)
+        subject_idx = sentence_tokens.index(subject_child)
+
+        print(f"    Verb '{verb_token.text}' at position {verb_idx}")
+        print(f"    Subject '{subject_child.text}' at position {subject_idx}")
+
+        # Look for qualifying words before the subject (like "another", "third")
+        qualifier_words = []
+
+        # Check tokens before the subject for qualifiers
+        search_start = max(0, subject_idx - 3)  # Look up to 3 tokens before
+        for i in range(search_start, subject_idx):
+            token_text = sentence_tokens[i].text.lower()
+            if token_text in ['another', 'third', 'second', 'other', 'next']:
+                qualifier_words.append(token_text)
+                print(f"    Found qualifier '{token_text}' at position {i}")
+
+        # Try to match humans based on qualifiers found
+        for human in humans:
+            human_text = human['text'].lower()
+            print(f"    Checking human: '{human['text']}'")
+
+            # If we found qualifiers, prioritize humans that contain them
+            if qualifier_words:
+                for qualifier in qualifier_words:
+                    if qualifier in human_text:
+                        print(f"    ✅ Matched human '{human['text']}' based on qualifier '{qualifier}'")
+                        return human
+
+            # Fallback: check if this human contains the subject word
+            if subject_child.text.lower() in human_text:
+                print(f"    Potential match: '{human['text']}' contains '{subject_child.text}'")
+                # But only return it if no qualifiers were found, or if this human is the most specific
+                if not qualifier_words:
+                    print(f"    ✅ Matched human '{human['text']}' (no qualifiers found)")
+                    return human
+
+        print(f"    ❌ No contextual match found for adverbial clause")
+        return None
+
+    def _find_best_human_match(self, verb_token, subject_child, humans):
+        """Find the best human match using position-aware contextual scoring"""
+        print(f"    🔍 Finding best human match for verb '{verb_token.text}' with subject '{subject_child.text}'")
+
+        # Get sentence structure
+        sentence_tokens = list(verb_token.sent)
+        verb_idx = sentence_tokens.index(verb_token)
+        subject_idx = sentence_tokens.index(subject_child)
+
+        print(f"    Verb '{verb_token.text}' at position {verb_idx}")
+        print(f"    Subject '{subject_child.text}' at position {subject_idx}")
+
+        # Score all potential human matches
+        human_scores = []
+
+        for human in humans:
+            score = self._calculate_human_match_score(
+                human, verb_token, subject_child, verb_idx, subject_idx, sentence_tokens
+            )
+            human_scores.append((human, score))
+            print(f"    Human '{human['text']}' score: {score:.2f}")
+
+        # Sort by score (highest first) and return best match
+        if human_scores:
+            human_scores.sort(key=lambda x: x[1], reverse=True)
+            best_human, best_score = human_scores[0]
+
+            # Only return if score is above threshold
+            if best_score > 0:
+                print(f"    ✅ Best match: '{best_human['text']}' with score {best_score:.2f}")
+                return best_human
+            else:
+                print(f"    ❌ No human scored above threshold (best: {best_score:.2f})")
+
+        return None
+
+    def _calculate_human_match_score(self, human, verb_token, subject_child, verb_idx, subject_idx, sentence_tokens):
+        """Calculate a score for how well a human matches a verb's subject"""
+        score = 0.0
+        human_text = human['text'].lower()
+        subject_text = subject_child.text.lower()
+
+        print(f"      Scoring '{human['text']}' for subject '{subject_child.text}'")
+
+        # 1. Text matching quality (most important)
+        if human_text == subject_text:
+            score += 50.0  # Exact match
+            print(f"        +50 exact text match")
+        elif subject_text in human_text:
+            # Check if it's a meaningful partial match vs just 'man'
+            if len(subject_text) > 3 or human_text == subject_text:  # Avoid matching just 'man'
+                score += 30.0  # Good partial match
+                print(f"        +30 good partial match")
+            else:
+                score += 5.0   # Weak partial match
+                print(f"        +5 weak partial match")
+        elif human_text in subject_text:
+            score += 10.0  # Reverse partial match
+            print(f"        +10 reverse partial match")
+        else:
+            # Check word overlap
+            human_words = set(human_text.split())
+            subject_words = set(subject_text.split())
+            overlap = len(human_words.intersection(subject_words))
+            if overlap > 0:
+                score += overlap * 5.0
+                print(f"        +{overlap * 5} word overlap")
+
+        # 2. Position-based scoring - find human position in sentence
+        human_positions = self._find_human_positions_in_sentence(human, sentence_tokens)
+        if human_positions:
+            # Use closest position to the subject
+            closest_human_pos = min(human_positions, key=lambda pos: abs(pos - subject_idx))
+            distance = abs(closest_human_pos - subject_idx)
+
+            # Strong bonus for being very close to the subject
+            if distance <= 2:
+                score += 20.0
+                print(f"        +20 very close position (distance: {distance})")
+            elif distance <= 5:
+                score += 10.0
+                print(f"        +10 close position (distance: {distance})")
+            else:
+                # Penalty for being far
+                penalty = min(distance - 5, 10)  # Cap penalty at 10
+                score -= penalty
+                print(f"        -{penalty} far position penalty (distance: {distance})")
+
+        # 3. Contextual qualifier bonus
+        # Look for qualifiers near the subject
+        search_start = max(0, subject_idx - 3)
+        search_end = min(len(sentence_tokens), subject_idx + 3)
+
+        qualifiers_found = []
+        for i in range(search_start, search_end):
+            token_text = sentence_tokens[i].text.lower()
+            if token_text in ['another', 'third', 'fourth', 'second', 'other', 'next']:
+                qualifiers_found.append(token_text)
+
+        for qualifier in qualifiers_found:
+            if qualifier in human_text:
+                score += 25.0  # Big bonus for matching qualifier
+                print(f"        +25 qualifier match: '{qualifier}'")
+
+        # 4. Sentence structure bonus
+        # Bonus for being in the same clause as the verb
+        if human_positions:
+            closest_human_pos = min(human_positions, key=lambda pos: abs(pos - verb_idx))
+            verb_distance = abs(closest_human_pos - verb_idx)
+
+            if verb_distance <= 5:
+                score += 15.0
+                print(f"        +15 same clause bonus (verb distance: {verb_distance})")
+
+        final_score = max(0.0, score)  # Don't allow negative scores
+        print(f"      Final score: {final_score:.2f}")
+        return final_score
+
+    def _find_best_human_match_position_only(self, verb_token, verb_idx, sentence_tokens, humans):
+        """Find best human match based only on position and context (no subject to match)"""
+        print(f"    🎯 Position-only matching for verb '{verb_token.text}' at position {verb_idx}")
+
+        human_scores = []
+
+        for human in humans:
+            score = 0.0
+            human_text = human['text'].lower()
+
+            print(f"      Scoring '{human['text']}' for position-based matching")
+
+            # 1. Find human positions in sentence
+            human_positions = self._find_human_positions_in_sentence(human, sentence_tokens)
+
+            if human_positions:
+                # Use closest position to verb
+                closest_pos = min(human_positions, key=lambda pos: abs(pos - verb_idx))
+                distance = abs(closest_pos - verb_idx)
+
+                # Score based on proximity to verb
+                if distance <= 3:
+                    score += 30.0  # Very close
+                    print(f"        +30 very close to verb (distance: {distance})")
+                elif distance <= 7:
+                    score += 20.0  # Close
+                    print(f"        +20 close to verb (distance: {distance})")
+                elif distance <= 15:
+                    score += 10.0  # Moderate
+                    print(f"        +10 moderate distance (distance: {distance})")
+                else:
+                    score += 5.0   # Far but still considered
+                    print(f"        +5 far from verb (distance: {distance})")
+
+                # 2. Look for contextual qualifiers near the human
+                search_start = max(0, closest_pos - 3)
+                search_end = min(len(sentence_tokens), closest_pos + 3)
+
+                qualifiers_found = []
+                for i in range(search_start, search_end):
+                    token_text = sentence_tokens[i].text.lower()
+                    if token_text in ['another', 'third', 'fourth', 'second', 'other', 'next']:
+                        qualifiers_found.append(token_text)
+
+                # Bonus for having qualifiers that make this human distinct
+                for qualifier in qualifiers_found:
+                    if qualifier in human_text:
+                        score += 20.0  # Qualifier match
+                        print(f"        +20 qualifier match: '{qualifier}'")
+
+                # 3. Priority bonus for specific human types
+                if 'another' in human_text:
+                    score += 15.0
+                    print(f"        +15 'another' priority bonus")
+                elif 'third' in human_text:
+                    score += 15.0
+                    print(f"        +15 'third' priority bonus")
+                elif 'fourth' in human_text:
+                    score += 15.0
+                    print(f"        +15 'fourth' priority bonus")
+
+            else:
+                print(f"        No positions found for '{human['text']}'")
+
+            final_score = max(0.0, score)
+            human_scores.append((human, final_score))
+            print(f"      Position-only score: {final_score:.2f}")
+
+        # Return best scoring human if above threshold
+        if human_scores:
+            human_scores.sort(key=lambda x: x[1], reverse=True)
+            best_human, best_score = human_scores[0]
+
+            if best_score > 0:
+                print(f"    ✅ Best position-only match: '{best_human['text']}' with score {best_score:.2f}")
+                return best_human
+
+        print(f"    ❌ No suitable position-based match found")
+        return None
 
     def _find_object_for_verb(self, verb_token, objects, doc):
         """Find object for a verb using dependency parsing with enhanced validation"""
@@ -1231,6 +1467,128 @@ class POSBasedHOIExtractorNoAdj:
 
         print(f"    Valid: '{verb}' compatible with '{obj_text}'")
         return True
+
+    def _find_human_positions_in_sentence(self, human, sentence_tokens):
+        """Find all positions where a human entity appears in the sentence"""
+        positions = []
+        human_text = human['text'].lower()
+        human_words = human_text.split()
+
+        print(f"  DEBUG: Looking for '{human['text']}' in sentence")
+
+        # Method 1: Look for consecutive word matches (most reliable)
+        if len(human_words) >= 2:  # Multi-word humans like "another man", "third man"
+            for i in range(len(sentence_tokens) - len(human_words) + 1):
+                # Check if consecutive tokens match human words exactly
+                match = True
+                for j, human_word in enumerate(human_words):
+                    token_text = sentence_tokens[i + j].text.lower()
+                    if human_word != token_text:
+                        match = False
+                        break
+                if match:
+                    positions.append(i)
+                    print(f"    Found multi-word match at position {i}: {[t.text for t in sentence_tokens[i:i+len(human_words)]]}")
+
+        # Method 2: Look for single word matches (for simple cases)
+        else:
+            for i, token in enumerate(sentence_tokens):
+                if token.text.lower() == human_text:
+                    positions.append(i)
+                    print(f"    Found single-word match at position {i}: '{token.text}'")
+
+        # Method 3: Fuzzy matching for partial matches (fallback)
+        if not positions:
+            print(f"    No exact matches found, trying fuzzy matching...")
+            for i, token in enumerate(sentence_tokens):
+                if any(hw in token.text.lower() for hw in human_words if len(hw) > 2):
+                    positions.append(i)
+                    print(f"    Found fuzzy match at position {i}: '{token.text}' matches part of '{human['text']}'")
+
+        print(f"    Final positions for '{human['text']}': {positions}")
+        return list(set(positions))  # Remove duplicates
+
+    def _calculate_human_verb_relevance(self, human, verb_token, human_pos, verb_pos, sentence_tokens):
+        """Calculate relevance score between human and verb based on context"""
+        relevance = 0.0
+        distance = abs(human_pos - verb_pos)
+        human_text = human['text'].lower()
+
+        print(f"    Calculating relevance: '{human['text']}' (pos {human_pos}) -> '{verb_token.text}' (pos {verb_pos}), distance: {distance}")
+
+        # STRONG bonus for proximity (exponential decay)
+        if distance <= 3:
+            proximity_score = 20.0  # Very close
+        elif distance <= 6:
+            proximity_score = 10.0  # Close
+        else:
+            proximity_score = max(0, 8 - distance)  # Diminishing returns
+        relevance += proximity_score
+
+        # STRONG bonus for human before verb (typical subject position)
+        if human_pos < verb_pos:
+            relevance += 15.0
+            print(f"      +15 for subject-before-verb pattern")
+
+            # Check if there's an auxiliary verb or "is" between human and main verb
+            between_tokens = sentence_tokens[human_pos:verb_pos]
+            has_auxiliary = any(token.pos_ == 'AUX' or token.text.lower() in ['is', 'are', 'was', 'were'] for token in between_tokens)
+            if has_auxiliary:
+                relevance += 10.0
+                print(f"      +10 for auxiliary verb between human and main verb")
+
+        # HUGE bonus for specific human qualifiers that indicate distinct subjects
+        if 'another' in human_text:
+            relevance += 25.0
+            print(f"      +25 for 'another' qualifier")
+        elif 'third' in human_text:
+            relevance += 25.0
+            print(f"      +25 for 'third' qualifier")
+        elif 'second' in human_text:
+            relevance += 20.0
+            print(f"      +20 for 'second' qualifier")
+
+        # Check for sentence boundary markers that separate clauses
+        between_start = min(human_pos, verb_pos)
+        between_end = max(human_pos, verb_pos)
+        between_tokens = sentence_tokens[between_start:between_end]
+
+        # Look for conjunctions, commas, or other clause separators
+        has_clause_separator = False
+        for token in between_tokens:
+            if token.text.lower() in ['and', 'but', 'while', ','] or token.pos_ in ['CCONJ', 'SCONJ']:
+                has_clause_separator = True
+                break
+
+        # If human is after a clause separator and before the verb, it's likely the new subject
+        if has_clause_separator and human_pos < verb_pos:
+            relevance += 15.0
+            print(f"      +15 for being new subject after clause separator")
+
+        # Penalty for very long distances (indicates unlikely association)
+        if distance > 10:
+            relevance -= 10.0
+            print(f"      -10 penalty for excessive distance")
+
+        final_score = max(0.0, relevance)
+        print(f"      Final relevance score: {final_score}")
+        return final_score
+
+    def _get_human_priority(self, human):
+        """Get priority score for human based on specificity"""
+        human_text = human['text'].lower()
+
+        # Higher priority for more specific human references
+        if 'another' in human_text:
+            return 3
+        elif 'third' in human_text:
+            return 3
+        elif 'second' in human_text:
+            return 2
+        elif 'man' in human_text or 'person' in human_text:
+            return 1
+        else:
+            return 0
 
     def _text_overlap_enhanced(self, text1, text2):
         """Enhanced text overlap detection with flexible matching"""
@@ -1720,6 +2078,7 @@ class HOIVisualizer:
 
     def _create_ground_truth_visualization(self, gt_hois, dataset_type):
         """Create visualization showing ground truth HOI annotations"""
+        print(f"  🎯 Creating ground truth visualization with {len(gt_hois)} HOI annotations")
 
         gt_img = self.image.copy()
         draw = ImageDraw.Draw(gt_img)
@@ -1799,6 +2158,7 @@ class HOIVisualizer:
 
     def _create_prediction_visualization(self, prediction_triplets, coordinates_info, evaluation_metrics):
         """Create visualization showing model predictions with match indicators"""
+        print(f"  🤖 Creating prediction visualization with {len(prediction_triplets)} triplets")
 
         pred_img = self.image.copy()
         draw = ImageDraw.Draw(pred_img)
@@ -1811,11 +2171,17 @@ class HOIVisualizer:
             font = ImageFont.load_default()
             font_small = ImageFont.load_default()
 
-        # Prediction colors - use orange theme to distinguish from ground truth and evaluation
-        pred_colors = {
-            'person': '#FF8C00',        # Orange for predicted person
-            'object': '#FF6600',        # Dark orange for predicted object
-            'connection': '#CC5500',    # Darker orange for connections
+        # Prediction colors - different colors for mapped vs unmapped actions
+        mapped_colors = {
+            'person': '#00AA00',        # Green for mapped actions (evaluable)
+            'object': '#00CC00',        # Light green for mapped objects
+            'connection': '#008800',    # Dark green for mapped connections
+        }
+
+        unmapped_colors = {
+            'person': '#FF4444',        # Red for unmapped actions (visualization-only)
+            'object': '#FF6666',        # Light red for unmapped objects
+            'connection': '#CC2222',    # Dark red for unmapped connections
         }
 
         # Create mapping of region_id to coordinates
@@ -1823,7 +2189,7 @@ class HOIVisualizer:
         for info in coordinates_info:
             coords_by_region[info['region_id']] = info
 
-        # Show all predictions regardless of evaluation matches - just for visualization
+        # Show all predictions with different colors based on mapping status
         for i, triplet in enumerate(prediction_triplets):
             human_region = triplet['human']['region_id']
             object_region = triplet['object']['region_id']
@@ -1832,10 +2198,20 @@ class HOIVisualizer:
             object_text = triplet['object']['text']  # Show raw predicted object
             confidence = triplet.get('confidence', 0.0)
 
-            # Use consistent orange colors for all predictions
-            person_color = pred_colors['person']
-            object_color = pred_colors['object']
-            connection_color = pred_colors['connection']
+            print(f"    Visualizing triplet {i+1}: '{human_text}' (R{human_region}) -> '{action}' -> '{object_text}' (R{object_region})")
+
+            # Determine color scheme based on mapping status
+            mapping_status = triplet.get('mapping_status', 'unknown')
+            if mapping_status == 'mapped':
+                colors = mapped_colors
+                status_indicator = "✅"
+            else:
+                colors = unmapped_colors
+                status_indicator = "⚠️"
+
+            person_color = colors['person']
+            object_color = colors['object']
+            connection_color = colors['connection']
 
             # Get coordinates
             if human_region in coords_by_region and object_region in coords_by_region:
@@ -1864,11 +2240,17 @@ class HOIVisualizer:
                 if human_center != object_center:
                     draw.line([human_center, object_center], fill=connection_color, width=2)
 
-                # Add labels - show standardized predictions for visualization
+                # Add labels with mapping status indicators
                 standardized_human = self._standardize_human_label_viz(human_text)
                 person_label = f"PRED-P{i+1}: {standardized_human}"
                 object_label = f"PRED-O{i+1}: {object_text}"
-                action_label = f"PRED: {action} ({confidence:.2f})"
+
+                # Include mapping status in action label
+                if mapping_status == 'mapped':
+                    action_label = f"{status_indicator} {action} ({confidence:.2f})"
+                else:
+                    warning_msg = triplet.get('warning', 'unmapped')
+                    action_label = f"{status_indicator} {action} ({confidence:.2f}) - UNMAPPED"
 
                 # Draw labels
                 self._draw_label(draw, human_bbox, person_label, person_color, font_small)
@@ -1879,6 +2261,9 @@ class HOIVisualizer:
                     mid_x = (human_center[0] + object_center[0]) // 2
                     mid_y = (human_center[1] + object_center[1]) // 2
                     self._draw_action_label(draw, (mid_x, mid_y), action_label, connection_color, font)
+
+        # Add legend to explain color coding
+        self._draw_legend(draw, pred_img.size, font_small, mapped_colors, unmapped_colors)
 
         return pred_img
 
@@ -1900,6 +2285,31 @@ class HOIVisualizer:
             draw.text(position, text, fill="white", font=font)
         except:
             draw.text(position, text, fill=color, font=font)
+
+    def _draw_legend(self, draw, img_size, font, mapped_colors, unmapped_colors):
+        """Draw legend explaining color coding"""
+        img_width, img_height = img_size
+
+        # Position legend in top-right corner
+        legend_x = img_width - 250
+        legend_y = 10
+
+        # Background for legend
+        legend_bg = (legend_x - 10, legend_y - 5, img_width - 10, legend_y + 80)
+        draw.rectangle(legend_bg, fill='white', outline='black', width=1)
+
+        # Legend title
+        draw.text((legend_x, legend_y), "Legend:", fill='black', font=font)
+
+        # Mapped actions
+        draw.rectangle([(legend_x, legend_y + 20), (legend_x + 15, legend_y + 30)],
+                      fill=mapped_colors['connection'], outline='black')
+        draw.text((legend_x + 20, legend_y + 18), "✅ Evaluable (in dataset)", fill='black', font=font)
+
+        # Unmapped actions
+        draw.rectangle([(legend_x, legend_y + 40), (legend_x + 15, legend_y + 50)],
+                      fill=unmapped_colors['connection'], outline='black')
+        draw.text((legend_x + 20, legend_y + 38), "⚠️ Unmapped (visualization-only)", fill='black', font=font)
 
     def _add_comparison_titles_and_legends(self, comparison_img, evaluation_metrics, img_width):
         """Add titles and legend to comparison image"""
@@ -2071,17 +2481,22 @@ def extract_object_description(response_text, region_token):
     return f"Region {region_token}"
 
 
-def load_dataset(dataset_type, data_root):
+def load_dataset(dataset_type, data_root, max_images=None):
     """Load dataset annotations"""
     if dataset_type == 'hico':
-        return load_hico_dataset(data_root)
+        return load_hico_dataset(data_root, max_images)
     elif dataset_type == 'swig':
-        return load_swig_dataset(data_root)
+        return load_swig_dataset(data_root, max_images)
     else:
         raise ValueError(f"Unsupported dataset type: {dataset_type}")
 
-def load_hico_dataset(data_root):
-    """Load HICO-DET test dataset"""
+def load_hico_dataset(data_root, max_images=None):
+    """Load HICO-DET test dataset
+
+    Args:
+        data_root: Root directory of HICO dataset
+        max_images: Maximum number of images to load (None for full dataset)
+    """
     test_ann_file = os.path.join(data_root, 'annotations', 'test_hico_ann.json')
     test_img_dir = os.path.join(data_root, 'images', 'test2015')
 
@@ -2092,6 +2507,13 @@ def load_hico_dataset(data_root):
 
     with open(test_ann_file, 'r') as f:
         annotations = json.load(f)
+
+    print(f"DEBUG: Found {len(annotations)} total annotations in HICO test file")
+
+    # Limit to max_images if specified
+    if max_images is not None:
+        annotations = annotations[:max_images]
+        print(f"DEBUG: Using subset of {len(annotations)} images for evaluation")
 
     dataset = []
     for ann in annotations:
@@ -2105,10 +2527,16 @@ def load_hico_dataset(data_root):
                 'height': ann.get('height', 480)
             })
 
+    print(f"DEBUG: Successfully loaded {len(dataset)} valid HICO images")
     return dataset
 
-def load_swig_dataset(data_root):
-    """Load SWIG-HOI test dataset"""
+def load_swig_dataset(data_root, max_images=None):
+    """Load SWIG-HOI test dataset
+
+    Args:
+        data_root: Root directory of SWIG dataset
+        max_images: Maximum number of images to load (None for full dataset)
+    """
     test_ann_file = os.path.join(data_root, 'annotations', 'swig_test_1000.json')
     test_img_dir = os.path.join(data_root, 'images_512')
 
@@ -2119,6 +2547,13 @@ def load_swig_dataset(data_root):
 
     with open(test_ann_file, 'r') as f:
         annotations = json.load(f)
+
+    print(f"DEBUG: Found {len(annotations)} total annotations in SWIG test file")
+
+    # Limit to max_images if specified
+    if max_images is not None:
+        annotations = annotations[:max_images]
+        print(f"DEBUG: Using subset of {len(annotations)} images for evaluation")
 
     dataset = []
     for ann in annotations:
@@ -2132,6 +2567,7 @@ def load_swig_dataset(data_root):
                 'height': ann.get('height', 512)
             })
 
+    print(f"DEBUG: Successfully loaded {len(dataset)} valid SWIG images")
     return dataset
 
 def find_image_in_dataset(image_path, dataset_type, data_root):
@@ -2514,6 +2950,31 @@ def eval_single_image(args):
     """Evaluate a single image (original functionality)"""
     return eval_hoi_no_adj_single(args)
 
+def save_comprehensive_results(evaluator, all_predictions, args, dataset, console_metrics, detailed_results):
+    """Save essential evaluation results with detailed HOI triplets"""
+    import datetime
+
+    # Get current timestamp
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    # Create results structure
+    results = {
+        "processing_summary": {
+            "total_images_in_dataset": len(dataset),
+            "successfully_processed": len(all_predictions),
+            "failed_skipped": len(dataset) - len(all_predictions),
+            "success_rate_percent": round((len(all_predictions) / len(dataset)) * 100, 1)
+        },
+        "evaluation_metrics": console_metrics,
+        "successfully_processed_images": detailed_results
+    }
+
+    # Save results file
+    results_file = os.path.join(args.output_dir, f"{args.dataset}_evaluation_results_{timestamp}.json")
+    with open(results_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"✅ Evaluation results saved: {results_file}")
+
 def eval_dataset(args):
     """Evaluate entire dataset"""
     print(f"\n{'='*80}")
@@ -2521,8 +2982,11 @@ def eval_dataset(args):
     print(f"{'='*80}")
 
     # Load dataset
-    dataset = load_dataset(args.dataset, args.data_root)
-    print(f"Loaded {len(dataset)} images from {args.dataset} dataset")
+    dataset = load_dataset(args.dataset, args.data_root, args.max_images)
+    if args.max_images:
+        print(f"Loaded {len(dataset)} images from {args.dataset} dataset (limited to {args.max_images} max)")
+    else:
+        print(f"Loaded {len(dataset)} images from {args.dataset} dataset (full set)")
 
     # Model setup
     disable_torch_init()
@@ -2572,10 +3036,12 @@ def eval_dataset(args):
 
     # Process dataset
     all_predictions = {}
+    detailed_results = []
 
     prompt = "[grounding] Describe what each person is doing with objects individually. Focus on actions only."
 
-    for i, sample in enumerate(tqdm(dataset[:100], desc="Processing images")):
+    print(f"Starting evaluation on {len(dataset)} images...")
+    for i, sample in enumerate(tqdm(dataset, desc=f"Processing {args.dataset.upper()} images")):
         try:
             # Load and process image
             raw_image = load_image(sample['image_path'])
@@ -2600,11 +3066,34 @@ def eval_dataset(args):
             if predictions:
                 all_predictions[sample['image_id']] = predictions
 
+                # Store detailed results for this image
+                detailed_results.append({
+                    "image_id": sample['image_id'],
+                    "file_name": sample['file_name'],
+                    "hoi_triplets": hoi_triplets,
+                    "extraction_stats": {
+                        "total_entities": len(entities),
+                        "humans_detected": len([e for e in entities if e['type'] == 'human']),
+                        "objects_detected": len([e for e in entities if e['type'] == 'object']),
+                        "triplets_extracted": len(hoi_triplets),
+                        "mapped_triplets": len([t for t in hoi_triplets if t.get('mapping_status') == 'mapped']),
+                        "unmapped_triplets": len([t for t in hoi_triplets if t.get('mapping_status') == 'unmapped']),
+                        "evaluation_predictions": len(predictions)
+                    }
+                })
+
         except Exception as e:
             print(f"Error processing image {sample['image_id']}: {str(e)}")
             continue
 
-    print(f"\nProcessed {len(all_predictions)} images with predictions")
+    print(f"\n{'='*50}")
+    print(f"PROCESSING COMPLETED")
+    print(f"{'='*50}")
+    print(f"Total images in dataset: {len(dataset)}")
+    print(f"Successfully processed: {len(all_predictions)}")
+    print(f"Failed/skipped: {len(dataset) - len(all_predictions)}")
+    print(f"Success rate: {len(all_predictions)/len(dataset)*100:.1f}%")
+    print(f"{'='*50}")
 
     # Update evaluator and compute metrics
     if all_predictions:
@@ -2613,10 +3102,48 @@ def eval_dataset(args):
 
         print("Computing metrics...")
         evaluator.accumulate()
+
+        # Capture console metrics before they're printed
+        console_metrics = {}
+        if hasattr(evaluator, 'hico_ap'):  # HICO dataset
+            valid_hois = np.nonzero(evaluator.hico_rec)[0]
+            if evaluator.zero_shot_interaction_ids is not None:
+                seen_hois = np.setdiff1d(valid_hois, evaluator.zero_shot_interaction_ids)
+                zero_shot_hois = np.setdiff1d(evaluator.zero_shot_interaction_ids, [])
+            else:
+                seen_hois = valid_hois
+                zero_shot_hois = []
+
+            console_metrics = {
+                "zero_shot_mAP": float(np.mean(evaluator.hico_ap[zero_shot_hois]) * 100) if len(zero_shot_hois) > 0 else 0.0,
+                "seen_mAP": float(np.mean(evaluator.hico_ap[seen_hois]) * 100) if len(seen_hois) > 0 else 0.0,
+                "full_mAP": float(np.mean(evaluator.hico_ap[valid_hois]) * 100) if len(valid_hois) > 0 else 0.0
+            }
+        elif hasattr(evaluator, 'swig_ap'):  # SWIG dataset
+            from groma.eval.hoi_eval.swig_v1_categories import SWIG_INTERACTIONS
+            eval_hois = np.asarray([x["id"] for x in SWIG_INTERACTIONS if x["evaluation"] == 1])
+            zero_hois = np.asarray([x["id"] for x in SWIG_INTERACTIONS if x["evaluation"] == 1 and x["frequency"] == 0])
+            rare_hois = np.asarray([x["id"] for x in SWIG_INTERACTIONS if x["frequency"] == 1 and x["evaluation"] == 1])
+            nonrare_hois = np.asarray([x["id"] for x in SWIG_INTERACTIONS if x["frequency"] == 2 and x["evaluation"] == 1])
+
+            console_metrics = {
+                "zero_shot_mAP": float(np.mean(evaluator.swig_ap[zero_hois]) * 100),
+                "rare_mAP": float(np.mean(evaluator.swig_ap[rare_hois]) * 100),
+                "nonrare_mAP": float(np.mean(evaluator.swig_ap[nonrare_hois]) * 100),
+                "full_mAP": float(np.mean(evaluator.swig_ap[eval_hois]) * 100)
+            }
+
         evaluator.summarize()
 
-        # Save predictions
-        evaluator.save_preds()
+        # Save comprehensive results (and optionally pickle files)
+        save_comprehensive_results(evaluator, all_predictions, args, dataset, console_metrics, detailed_results)
+
+        # Only save pickle files if explicitly requested
+        if args.save_pkl:
+            print("Saving legacy pickle files...")
+            evaluator.save_preds()
+        else:
+            print("Skipping pickle file generation (use --save-pkl to enable)")
 
         print(f"\nEvaluation complete. Results saved to: {args.output_dir}")
     else:
@@ -2746,8 +3273,11 @@ def eval_hoi_no_adj_single(args):
     # Extract HOI triplets using POS approach with adjective removal
     hoi_triplets = hoi_extractor.extract_hoi_triplets(response_text, entities, coordinates_info, eval_dataset_type)
 
+    # Prepare visualization triplets with mapping status
+    visualization_triplets = hoi_extractor.prepare_visualization_triplets(hoi_triplets, eval_dataset_type)
+
     print("🎭 Extracted HOI Triplets:")
-    for i, triplet in enumerate(hoi_triplets, 1):
+    for i, triplet in enumerate(visualization_triplets, 1):
         human_text = triplet['human']['text']
         human_region = triplet['human']['region_id']
         action = triplet['action']
@@ -2755,6 +3285,11 @@ def eval_hoi_no_adj_single(args):
         object_region = triplet['object']['region_id']
         confidence = triplet['confidence']
         method = triplet.get('extraction_method', 'unknown')
+        mapping_status = triplet.get('mapping_status', 'unknown')
+
+        # Status indicator based on mapping
+        status_icon = "✅" if mapping_status == 'mapped' else "⚠️"
+        status_text = f"({mapping_status.upper()})" if mapping_status == 'mapped' else f"({mapping_status.upper()} - not in {eval_dataset_type.upper()} dataset)"
 
         # Show original object text if different
         original_note = ""
@@ -2785,7 +3320,7 @@ def eval_hoi_no_adj_single(args):
         if original_action != normalized_action:
             action_display = f"{normalized_action} [{original_action} → {normalized_action}]"
 
-        print(f"  {i}. Human: '{human_text}' (R{human_region}) -> Action: '{action_display}' -> Object: '{object_text}' (R{object_region}){original_note} (Confidence: {confidence:.2f}, Method: {method}){bbox_info}")
+        print(f"  {i}. {status_icon} Human: '{human_text}' (R{human_region}) -> Action: '{action_display}' -> Object: '{object_text}' (R{object_region}){original_note} (Confidence: {confidence:.2f}, Method: {method}) {status_text}{bbox_info}")
 
     print()
 
@@ -2865,55 +3400,53 @@ def eval_hoi_no_adj_single(args):
     # Create visualization
     visualizer = HOIVisualizer(raw_image)
 
-    # Always create comparison visualization if ground truth is available
-    if gt_hois:
-        # Create side-by-side comparison regardless of evaluation predictions
-        if dataset_type:
-            viz_path = os.path.join(output_dir, f'{image_name}_{dataset_type}_comparison_visualization.jpg')
-        else:
-            viz_path = os.path.join(output_dir, f'{image_name}_comparison_visualization.jpg')
+    # ALWAYS create visualization - with or without ground truth
+    if dataset_type:
+        viz_path = os.path.join(output_dir, f'{image_name}_{dataset_type}_comparison_visualization.jpg')
+    else:
+        viz_path = os.path.join(output_dir, f'{image_name}_comparison_visualization.jpg')
 
-        try:
-            # Calculate metrics for visualization (even if no evaluation predictions)
+    try:
+        # Create comparison visualization regardless of ground truth availability
+        if gt_hois and len(gt_hois) > 0:
+            print(f"🎨 Creating comparison with ground truth ({len(gt_hois)} GT HOIs)")
+            # Calculate metrics for visualization
             if len(evaluation_predictions) > 0:
                 metrics = calculate_single_image_metrics(evaluation_predictions, gt_hois, original_width, original_height)
+                print(f"   📊 Calculated metrics: {metrics['true_positives']} TP, P={metrics['precision']:.3f}, R={metrics['recall']:.3f}")
             else:
                 # No evaluation predictions, but still show comparison
                 metrics = {'matches': [], 'precision': 0.0, 'recall': 0.0, 'true_positives': 0, 'total_predictions': 0, 'total_gt': len(gt_hois)}
+                print(f"   ⚠️ No evaluation predictions, showing comparison with GT only")
 
-            # Always show comparison - even if no evaluation predictions, show raw triplets vs ground truth
+            # Always show comparison - show visualization triplets (with mapping status) vs ground truth
             viz_image = visualizer.visualize_comparison(
-                hoi_triplets, coordinates_info, gt_hois, metrics, viz_path, dataset_type or 'hico'
+                visualization_triplets, coordinates_info, gt_hois, metrics, viz_path, dataset_type or 'hico'
             )
             print(f"✅ Side-by-side comparison visualization saved: {viz_path}")
-        except Exception as e:
-            print(f"❌ Comparison visualization failed: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            # Fall back to regular visualization
-            try:
-                if dataset_type:
-                    fallback_path = os.path.join(output_dir, f'{image_name}_{dataset_type}_predictions_only.jpg')
-                else:
-                    fallback_path = os.path.join(output_dir, f'{image_name}_predictions_only.jpg')
-                viz_image = visualizer.visualize_triplets(hoi_triplets, coordinates_info, fallback_path)
-                print(f"✅ Fallback visualization saved: {fallback_path}")
-            except Exception as e2:
-                print(f"❌ Fallback visualization also failed: {str(e2)}")
-    else:
-        # Use regular visualization (no ground truth available)
-        if dataset_type:
-            viz_path = os.path.join(output_dir, f'{image_name}_{dataset_type}_predictions_only.jpg')
         else:
-            viz_path = os.path.join(output_dir, f'{image_name}_hoi_no_adj_visualization.jpg')
-
+            print(f"🎨 Creating predictions-only visualization (no ground truth available)")
+            # No ground truth available, show predictions only
+            if dataset_type:
+                pred_only_path = os.path.join(output_dir, f'{image_name}_{dataset_type}_predictions_only.jpg')
+            else:
+                pred_only_path = os.path.join(output_dir, f'{image_name}_predictions_only.jpg')
+            viz_image = visualizer.visualize_triplets(visualization_triplets, coordinates_info, pred_only_path)
+            print(f"✅ Predictions-only visualization saved: {pred_only_path}")
+    except Exception as e:
+        print(f"❌ Visualization failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        # Final fallback - simple triplet visualization
         try:
-            viz_image = visualizer.visualize_triplets(hoi_triplets, coordinates_info, viz_path)
-            print(f"✅ Standard visualization saved: {viz_path}")
-        except Exception as e:
-            print(f"❌ Standard visualization failed: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            if dataset_type:
+                fallback_path = os.path.join(output_dir, f'{image_name}_{dataset_type}_fallback.jpg')
+            else:
+                fallback_path = os.path.join(output_dir, f'{image_name}_fallback.jpg')
+            viz_image = visualizer.visualize_triplets(visualization_triplets, coordinates_info, fallback_path)
+            print(f"✅ Fallback visualization saved: {fallback_path}")
+        except Exception as e2:
+            print(f"❌ All visualization attempts failed: {str(e2)}")
 
     # Prepare detailed results
     results = {
@@ -2925,7 +3458,7 @@ def eval_hoi_no_adj_single(args):
         'response': response_text,
         'entities': entities,
         'coordinates_info': coordinates_info,
-        'hoi_triplets': hoi_triplets,
+        'hoi_triplets': visualization_triplets,
         'evaluation_predictions': evaluation_predictions,
         'extraction_method': 'pos_based_with_adjective_removal'
     }
@@ -2942,12 +3475,17 @@ def eval_hoi_no_adj_single(args):
         metrics = calculate_single_image_metrics(evaluation_predictions, gt_hois, original_width, original_height)
         results['evaluation_metrics'] = metrics
 
-    # Add extraction stats
+    # Add extraction stats with mapping information
+    mapped_triplets = len([t for t in visualization_triplets if t.get('mapping_status') == 'mapped'])
+    unmapped_triplets = len([t for t in visualization_triplets if t.get('mapping_status') == 'unmapped'])
+
     results['extraction_stats'] = {
         'total_entities': len(entities),
         'humans_detected': len([e for e in entities if e['type'] == 'human']),
         'objects_detected': len([e for e in entities if e['type'] == 'object']),
-        'triplets_extracted': len(hoi_triplets),
+        'triplets_extracted': len(visualization_triplets),
+        'mapped_triplets': mapped_triplets,
+        'unmapped_triplets': unmapped_triplets,
         'evaluation_predictions': len(evaluation_predictions)
     }
 
@@ -2972,11 +3510,11 @@ def eval_hoi_no_adj_single(args):
     print(f"{'='*80}")
     print(f"📸 Image: {os.path.basename(args.image_file)}")
     print(f"🧠 Entities Detected: {len(entities)} ({len([e for e in entities if e['type'] == 'human'])} humans, {len([e for e in entities if e['type'] == 'object'])} objects)")
-    print(f"🎭 HOI Triplets: {len(hoi_triplets)}")
+    print(f"🎭 HOI Triplets: {len(visualization_triplets)} ({mapped_triplets} mapped + {unmapped_triplets} unmapped)")
     print(f"📊 Evaluation Predictions: {len(evaluation_predictions)}")
+    print(f"🎯 Ground Truth HOIs: {len(gt_hois) if gt_hois else 'N/A'}")
 
     if gt_hois:
-        print(f"🎯 Ground Truth HOIs: {len(gt_hois)}")
         if evaluation_predictions:
             metrics = calculate_single_image_metrics(evaluation_predictions, gt_hois, original_width, original_height)
             print(f"✅ True Positives: {metrics['true_positives']}")
@@ -3034,6 +3572,12 @@ def main():
     # Output arguments
     parser.add_argument("--output-dir", type=str, default='hoi_evaluation_output',
                        help="Output directory for results")
+    parser.add_argument("--save-pkl", action='store_true',
+                       help="Save pickle files (legacy format). By default, only JSON results are saved.")
+
+    # Evaluation control
+    parser.add_argument("--max-images", type=int, default=None,
+                       help="Maximum number of images to process (default: None for full dataset)")
 
     args = parser.parse_args()
 
