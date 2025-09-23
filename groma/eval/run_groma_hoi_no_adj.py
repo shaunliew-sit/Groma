@@ -227,8 +227,8 @@ class POSBasedHOIExtractorNoAdj:
         # Return standardized label if human, otherwise return original
         return 'person' if is_human else text
 
-    def extract_hoi_triplets(self, response_text, entities, coordinates_info):
-        """Extract HOI triplets using POS-based verb detection"""
+    def extract_hoi_triplets(self, response_text, entities, coordinates_info, dataset_type='hico'):
+        """Extract HOI triplets using POS-based verb detection with dataset-specific action normalization"""
         triplets = []
 
         # Remove grounding markup for text analysis
@@ -236,10 +236,10 @@ class POSBasedHOIExtractorNoAdj:
         clean_text = clean_text.replace('</s>', '').strip()
 
         if self.nlp:
-            triplets.extend(self._extract_with_pos_spacy(clean_text, entities, coordinates_info))
+            triplets.extend(self._extract_with_pos_spacy(clean_text, entities, coordinates_info, dataset_type))
         else:
             print("WARNING: spaCy not available, falling back to basic pattern matching")
-            triplets.extend(self._extract_with_basic_patterns(clean_text, entities, coordinates_info))
+            triplets.extend(self._extract_with_basic_patterns(clean_text, entities, coordinates_info, dataset_type))
 
         return self._deduplicate_triplets(triplets)
 
@@ -322,9 +322,9 @@ class POSBasedHOIExtractorNoAdj:
             return None
 
     def _normalize_action(self, action):
-        """Return original action without static mapping to preserve Groma's generated words"""
+        """Convert action to root form for HICO evaluation using spaCy"""
         action = action.lower().strip()
-        return action
+        return self._convert_verb_to_root(action)
 
     def _normalize_object_for_hico(self, object_text):
         """Normalize object names for HICO mapping - only person mappings preserved"""
@@ -363,9 +363,9 @@ class POSBasedHOIExtractorNoAdj:
         return person_mappings.get(object_text, object_text)
 
     def _normalize_action_for_swig(self, action):
-        """Return original action without static mapping to preserve Groma's generated words"""
+        """Convert action to continuous form for SWIG evaluation using morphological rules"""
         action = action.lower().strip()
-        return action
+        return self._convert_verb_to_continuous(action)
 
     def _normalize_object_for_swig(self, object_text):
         """Normalize object names for SWIG mapping - only person mappings preserved"""
@@ -402,6 +402,226 @@ class POSBasedHOIExtractorNoAdj:
         }
 
         return person_mappings.get(object_text, object_text)
+
+    def _convert_verb_to_root(self, verb):
+        """Convert verb to root form using spaCy lemmatization (for HICO)"""
+        if not self.nlp:
+            # Fallback: improved heuristics if spaCy not available
+            verb = verb.lower().strip()
+
+            # Handle -ing suffix
+            if verb.endswith('ing'):
+                base = verb[:-3]
+
+                # Handle doubling consonants: running -> run, sitting -> sit
+                if len(base) >= 2 and base[-1] == base[-2] and base[-1] not in 'aeiou':
+                    return base[:-1]
+
+                # Handle 'e' dropping rule reversal: making -> make, taking -> take
+                # Check if adding 'e' would make a valid word pattern
+                if len(base) >= 2:
+                    # Common patterns where 'e' was dropped before adding 'ing'
+                    potential_e_endings = ['ak', 'av', 'ic', 'id', 'ig', 'im', 'in', 'ir', 'is', 'it', 'iv', 'iz']
+                    if any(base.endswith(ending) for ending in potential_e_endings):
+                        return base + 'e'
+
+                    # Specific common action verbs with 'e' dropping
+                    e_drop_verbs = {
+                        'mak': 'make',
+                        'tak': 'take',
+                        'giv': 'give',
+                        'hav': 'have',
+                        'com': 'come',
+                        'writ': 'write',
+                        'driv': 'drive',
+                        'lov': 'love',
+                        'liv': 'live',
+                        'mov': 'move',
+                        'sav': 'save',
+                        'clos': 'close',
+                        'us': 'use',
+                        'caus': 'cause',
+                        'chang': 'change',
+                        'exchang': 'exchange',
+                        'arrang': 'arrange',
+                        'manag': 'manage',
+                        'damag': 'damage',
+                        'handl': 'handle',
+                        'shak': 'shake',
+                        'bak': 'bake',
+                        'rac': 'race',
+                        'fac': 'face',
+                        'plac': 'place',
+                        'trac': 'trace',
+                        'forc': 'force',
+                        'danc': 'dance',
+                        'balanc': 'balance',
+                        'practic': 'practice',
+                        'notic': 'notice',
+                        'serv': 'serve',
+                        'observ': 'observe',
+                        'deserv': 'deserve',
+                        'reserv': 'reserve',
+                        'preserv': 'preserve'
+                    }
+
+                    if base in e_drop_verbs:
+                        return e_drop_verbs[base]
+
+                # Default: just remove 'ing'
+                return base
+
+            # Handle -ed suffix
+            elif verb.endswith('ed'):
+                if verb.endswith('ied'):
+                    return verb[:-3] + 'y'
+                else:
+                    base = verb[:-2]
+                    # Handle doubling consonants: stopped -> stop
+                    if len(base) >= 2 and base[-1] == base[-2] and base[-1] not in 'aeiou':
+                        return base[:-1]
+                    return base
+
+            # No suffix to remove
+            return verb
+
+        # Use spaCy for proper lemmatization (preferred method)
+        doc = self.nlp(verb.strip())
+        if doc and len(doc) > 0:
+            return doc[0].lemma_.lower()
+        return verb.lower().strip()
+
+    def _convert_verb_to_continuous(self, verb):
+        """Convert verb to continuous form (-ing) using morphological rules (for SWIG)"""
+        verb = verb.lower().strip()
+
+        # Already in continuous form
+        if verb.endswith('ing'):
+            return verb
+
+        # Handle special cases and irregular verbs
+        irregular_verbs = {
+            'be': 'being',
+            'have': 'having',
+            'do': 'doing',
+            'go': 'going',
+            'get': 'getting',
+            'make': 'making',
+            'take': 'taking',
+            'come': 'coming',
+            'see': 'seeing',
+            'know': 'knowing',
+            'think': 'thinking',
+            'look': 'looking',
+            'use': 'using',
+            'find': 'finding',
+            'give': 'giving',
+            'tell': 'telling',
+            'work': 'working',
+            'call': 'calling',
+            'try': 'trying',
+            'ask': 'asking',
+            'need': 'needing',
+            'feel': 'feeling',
+            'become': 'becoming',
+            'leave': 'leaving',
+            'put': 'putting',
+            'mean': 'meaning',
+            'keep': 'keeping',
+            'let': 'letting',
+            'begin': 'beginning',
+            'seem': 'seeming',
+            'help': 'helping',
+            'show': 'showing',
+            'hear': 'hearing',
+            'play': 'playing',
+            'run': 'running',
+            'move': 'moving',
+            'live': 'living',
+            'believe': 'believing',
+            'hold': 'holding',
+            'bring': 'bringing',
+            'happen': 'happening',
+            'write': 'writing',
+            'sit': 'sitting',
+            'stand': 'standing',
+            'lose': 'losing',
+            'pay': 'paying',
+            'meet': 'meeting',
+            'include': 'including',
+            'continue': 'continuing',
+            'set': 'setting',
+            'learn': 'learning',
+            'change': 'changing',
+            'lead': 'leading',
+            'understand': 'understanding',
+            'watch': 'watching',
+            'follow': 'following',
+            'stop': 'stopping',
+            'create': 'creating',
+            'speak': 'speaking',
+            'read': 'reading',
+            'spend': 'spending',
+            'grow': 'growing',
+            'open': 'opening',
+            'walk': 'walking',
+            'win': 'winning',
+            'teach': 'teaching',
+            'offer': 'offering',
+            'remember': 'remembering',
+            'love': 'loving',
+            'consider': 'considering',
+            'appear': 'appearing',
+            'buy': 'buying',
+            'serve': 'serving',
+            'die': 'dying',
+            'send': 'sending',
+            'build': 'building',
+            'stay': 'staying',
+            'fall': 'falling',
+            'cut': 'cutting',
+            'reach': 'reaching',
+            'kill': 'killing',
+            'raise': 'raising',
+            'pass': 'passing',
+            'sell': 'selling',
+            'decide': 'deciding',
+            'return': 'returning',
+            'explain': 'explaining',
+            'hope': 'hoping',
+            'develop': 'developing',
+            'carry': 'carrying',
+            'break': 'breaking',
+            'receive': 'receiving',
+            'agree': 'agreeing',
+            'support': 'supporting',
+            'hit': 'hitting',
+            'produce': 'producing',
+            'eat': 'eating',
+            'cover': 'covering',
+            'catch': 'catching',
+            'draw': 'drawing'
+        }
+
+        if verb in irregular_verbs:
+            return irregular_verbs[verb]
+
+        # Apply general morphological rules
+        # Rule 1: CVC pattern (consonant-vowel-consonant) -> double final consonant
+        if len(verb) >= 3 and verb[-1] not in 'aeiou' and verb[-2] in 'aeiou' and verb[-3] not in 'aeiou':
+            if verb[-1] not in 'wxyz':  # Don't double w, x, y, z
+                return verb + verb[-1] + 'ing'
+
+        # Rule 2: Words ending in 'e' (except 'ee', 'oe', 'ye') -> drop 'e' and add 'ing'
+        if verb.endswith('e') and not verb.endswith(('ee', 'oe', 'ye')):
+            return verb[:-1] + 'ing'
+
+        # Rule 3: Words ending in 'ie' -> change 'ie' to 'y' and add 'ing'
+        if verb.endswith('ie'):
+            return verb[:-2] + 'ying'
+
+        # Rule 4: Default -> just add 'ing'
+        return verb + 'ing'
 
     def _find_swig_action_id(self, action_name):
         """Find SWIG action ID by name"""
@@ -484,13 +704,18 @@ class POSBasedHOIExtractorNoAdj:
         predictions = []
 
         for triplet in triplets:
-            # Get HOI ID
+            # Action is already normalized in the triplet
             action = triplet['action']
+            original_action = triplet.get('original_action', action)
             object_text = triplet['object']['text']
+
             hoi_id = self.map_to_hoi_id(action, object_text, dataset_type)
 
             if hoi_id is None:
-                print(f"WARNING: Could not map ({action}, {object_text}) to HOI ID")
+                if original_action != action:
+                    print(f"WARNING: Could not map normalized action ({original_action} → {action}, {object_text}) to HOI ID")
+                else:
+                    print(f"WARNING: Could not map action ({action}, {object_text}) to HOI ID")
                 continue
 
             # Convert coordinates to absolute pixels
@@ -527,7 +752,7 @@ class POSBasedHOIExtractorNoAdj:
 
         return predictions
 
-    def _extract_with_pos_spacy(self, text, entities, coordinates_info):
+    def _extract_with_pos_spacy(self, text, entities, coordinates_info, dataset_type='hico'):
         """Use spaCy POS tagging to extract any VERB as potential action"""
         if not self.nlp:
             return []
@@ -609,18 +834,29 @@ class POSBasedHOIExtractorNoAdj:
                     if coord_info['region_id'] == object_entity['region_id']:
                         object_coords = coord_info['coordinates']
 
-                # Create triplet with bounding box information
+                # Normalize action based on dataset requirements
+                original_action = action
+                if dataset_type == 'hico':
+                    normalized_action = self._normalize_action(original_action)
+                elif dataset_type == 'swig':
+                    normalized_action = self._normalize_action_for_swig(original_action)
+                else:
+                    normalized_action = original_action
+
+                # Create triplet with normalized action as primary
                 triplet = {
                     'human': human_entity,
                     'human_bbox': human_coords,
-                    'action': action,
+                    'action': normalized_action,
+                    'original_action': original_action,
                     'object': object_entity,
                     'object_bbox': object_coords,
                     'confidence': 0.9,
                     'extraction_method': 'pos_spacy_no_adj'
                 }
                 triplets.append(triplet)
-                print(f"✅ POS SUCCESS: {human_entity['text']} (R{human_entity['region_id']}) -> {action} -> {object_entity['text']} (R{object_entity['region_id']})")
+                action_display = f"{normalized_action}" if original_action == normalized_action else f"{normalized_action} [{original_action} → {normalized_action}]"
+                print(f"✅ POS SUCCESS: {human_entity['text']} (R{human_entity['region_id']}) -> {action_display} -> {object_entity['text']} (R{object_entity['region_id']})")
             else:
                 print(f"❌ POS FAILED: verb '{action}' - human: {human_entity is not None}, object: {object_entity is not None}")
 
@@ -1049,7 +1285,7 @@ class POSBasedHOIExtractorNoAdj:
         words = [w for w in text.split() if w not in stop_words]
         return ' '.join(words)
 
-    def _extract_with_basic_patterns(self, text, entities, coordinates_info):
+    def _extract_with_basic_patterns(self, text, entities, coordinates_info, dataset_type='hico'):
         """Fallback pattern-based extraction when spaCy is not available"""
         triplets = []
 
@@ -1089,30 +1325,30 @@ class POSBasedHOIExtractorNoAdj:
                         human_text, action1, object1_text, action2, object2_text = groups
 
                         # Process first action
-                        triplets.extend(self._process_basic_action(human_text, action1, object1_text, humans, objects, coordinates_info))
+                        triplets.extend(self._process_basic_action(human_text, action1, object1_text, humans, objects, coordinates_info, dataset_type))
                         # Process second action
-                        triplets.extend(self._process_basic_action(human_text, action2, object2_text, humans, objects, coordinates_info))
+                        triplets.extend(self._process_basic_action(human_text, action2, object2_text, humans, objects, coordinates_info, dataset_type))
 
                     elif len(groups) == 4:  # Pattern 2: "standing..., holding..."
                         human_text, action1, action2, object2_text = groups
 
                         # Process the holding action (more likely to be relevant)
-                        triplets.extend(self._process_basic_action(human_text, action2, object2_text, humans, objects, coordinates_info))
+                        triplets.extend(self._process_basic_action(human_text, action2, object2_text, humans, objects, coordinates_info, dataset_type))
 
                     elif len(groups) == 3:  # Pattern 3: simple subject-action-object
                         human_text, action, object_text = groups
-                        triplets.extend(self._process_basic_action(human_text, action, object_text, humans, objects, coordinates_info))
+                        triplets.extend(self._process_basic_action(human_text, action, object_text, humans, objects, coordinates_info, dataset_type))
 
                     elif len(groups) == 2:  # Pattern 4: action-object only
                         action, object_text = groups
                         # Try to match with any available human
                         for human in humans:
-                            triplets.extend(self._process_basic_action(human['text'], action, object_text, humans, objects, coordinates_info))
+                            triplets.extend(self._process_basic_action(human['text'], action, object_text, humans, objects, coordinates_info, dataset_type))
                             break  # Just use first human for simplicity
 
         return triplets
 
-    def _process_basic_action(self, human_text, action, object_text, humans, objects, coordinates_info):
+    def _process_basic_action(self, human_text, action, object_text, humans, objects, coordinates_info, dataset_type='hico'):
         """Process a single action from basic pattern matching"""
         single_triplets = []
 
@@ -1172,17 +1408,28 @@ class POSBasedHOIExtractorNoAdj:
                 if coord_info['region_id'] == object_entity['region_id']:
                     object_coords = coord_info['coordinates']
 
+            # Normalize action based on dataset requirements
+            original_action = action_clean
+            if dataset_type == 'hico':
+                normalized_action = self._normalize_action(original_action)
+            elif dataset_type == 'swig':
+                normalized_action = self._normalize_action_for_swig(original_action)
+            else:
+                normalized_action = original_action
+
             triplet = {
                 'human': human_entity,
                 'human_bbox': human_coords,
-                'action': action_clean,
+                'action': normalized_action,
+                'original_action': original_action,
                 'object': object_entity,
                 'object_bbox': object_coords,
                 'confidence': 0.7,
                 'extraction_method': 'basic_pattern_enhanced_no_adj'
             }
             single_triplets.append(triplet)
-            print(f"    ✅ BASIC SUCCESS: {human_entity['text']} -> {action_clean} -> {object_entity['text']}")
+            action_display = f"{normalized_action}" if original_action == normalized_action else f"{normalized_action} [{original_action} → {normalized_action}]"
+            print(f"    ✅ BASIC SUCCESS: {human_entity['text']} -> {action_display} -> {object_entity['text']}")
         else:
             print(f"    ❌ BASIC FAILED: human={human_entity is not None}, object={object_entity is not None}")
 
@@ -1227,14 +1474,22 @@ class HOIVisualizer:
         for i, triplet in enumerate(triplets):
             human_text = triplet['human']['text']
             human_region = triplet['human']['region_id']
-            action = triplet['action']
+            # Now triplet['action'] is the normalized action
+            normalized_action = triplet['action']
+            original_action = triplet.get('original_action', normalized_action)
             object_text = triplet['object']['text']
             object_region = triplet['object']['region_id']
+
+            # Show action normalization if different
+            action_note = ""
+            if original_action != normalized_action:
+                action_note = f" [{original_action} → {normalized_action}]"
+
             # Show original text if different
             original_note = ""
             if 'original_text' in triplet['object'] and triplet['object']['original_text'] != object_text:
                 original_note = f" (original: '{triplet['object']['original_text']}')"
-            print(f"  Triplet {i+1}: '{human_text}' (R{human_region}) -> {action} -> '{object_text}' (R{object_region}){original_note}")
+            print(f"  Triplet {i+1}: '{human_text}' (R{human_region}) -> {normalized_action}{action_note} -> '{object_text}' (R{object_region}){original_note}")
 
         # Create a copy of the image for drawing
         viz_image = self.image.copy()
@@ -1281,7 +1536,11 @@ class HOIVisualizer:
             object_text = triplet['object']['text']
             action = triplet['action']
 
-            print(f"DEBUG: Processing triplet: '{human_text}' (R{human_region}) -> {action} -> '{object_text}' (R{object_region})")
+            # Now triplet['action'] is the normalized action
+            normalized_action = action
+            original_action = triplet.get('original_action', normalized_action)
+            action_note = f" [{original_action} → {normalized_action}]" if original_action != normalized_action else ""
+            print(f"DEBUG: Processing triplet: '{human_text}' (R{human_region}) -> {normalized_action}{action_note} -> '{object_text}' (R{object_region})")
 
             # Add human region to drawing list
             if human_region not in regions_to_draw:
@@ -1352,7 +1611,11 @@ class HOIVisualizer:
             human_text = triplet['human']['text']
             object_text = triplet['object']['text']
 
-            print(f"DEBUG: Drawing triplet {i+1}: '{human_text}' (R{human_region}) -> {action} -> '{object_text}' (R{object_region})")
+            # Now triplet['action'] is the normalized action
+            normalized_action = action
+            original_action = triplet.get('original_action', normalized_action)
+            action_note = f" [{original_action} → {normalized_action}]" if original_action != normalized_action else ""
+            print(f"DEBUG: Drawing triplet {i+1}: '{human_text}' (R{human_region}) -> {normalized_action}{action_note} -> '{object_text}' (R{object_region})")
 
             human_coords_info = coords_by_region.get(human_region)
             object_coords_info = coords_by_region.get(object_region)
@@ -1374,12 +1637,21 @@ class HOIVisualizer:
                 mid_x = (human_center[0] + object_center[0]) // 2
                 mid_y = (human_center[1] + object_center[1]) // 2
 
-                action_text = f"{action.upper()}"
+                # Get normalized action for display
+                normalized_action = action
+                original_action = triplet.get('original_action', normalized_action)
+
+                # Show normalized action with original if different
+                if original_action != normalized_action:
+                    action_text = f"{normalized_action.upper()}\n({original_action})"
+                else:
+                    action_text = f"{normalized_action.upper()}"
+
                 action_bbox = draw.textbbox((mid_x, mid_y), action_text, font=font)
                 draw.rectangle(action_bbox, fill=self.colors['action'])
                 draw.text((mid_x, mid_y), action_text, fill="white", font=font)
 
-                print(f"DEBUG: Drew connection from {human_center} to {object_center} with action '{action}'")
+                print(f"DEBUG: Drew connection from {human_center} to {object_center} with action '{normalized_action}'{action_note}'")
             else:
                 print(f"DEBUG: Could not find coordinates for triplet - Human: {human_coords_info is not None}, Object: {object_coords_info is not None}")
 
@@ -2318,7 +2590,7 @@ def eval_dataset(args):
 
             # Parse entities and extract triplets
             entities = hoi_extractor.parse_grounded_response(response_text)
-            hoi_triplets = hoi_extractor.extract_hoi_triplets(response_text, entities, coordinates_info)
+            hoi_triplets = hoi_extractor.extract_hoi_triplets(response_text, entities, coordinates_info, args.dataset)
 
             # Convert to evaluation format
             predictions = hoi_extractor.convert_triplets_to_predictions(
@@ -2469,8 +2741,10 @@ def eval_hoi_no_adj_single(args):
     print()
 
     print(f"🔗 STEP 3: EXTRACTING HOI TRIPLETS...")
+    # Determine dataset type for extraction
+    eval_dataset_type = dataset_type if dataset_type else 'hico'
     # Extract HOI triplets using POS approach with adjective removal
-    hoi_triplets = hoi_extractor.extract_hoi_triplets(response_text, entities, coordinates_info)
+    hoi_triplets = hoi_extractor.extract_hoi_triplets(response_text, entities, coordinates_info, eval_dataset_type)
 
     print("🎭 Extracted HOI Triplets:")
     for i, triplet in enumerate(hoi_triplets, 1):
@@ -2504,13 +2778,19 @@ def eval_hoi_no_adj_single(args):
 
                 bbox_info = f" | Human bbox: [{human_bbox[0]:.3f}, {human_bbox[1]:.3f}, {human_bbox[2]:.3f}, {human_bbox[3]:.3f}] | Object bbox: [{object_bbox[0]:.3f}, {object_bbox[1]:.3f}, {object_bbox[2]:.3f}, {object_bbox[3]:.3f}]"
 
-        print(f"  {i}. Human: '{human_text}' (R{human_region}) -> Action: '{action}' -> Object: '{object_text}' (R{object_region}){original_note} (Confidence: {confidence:.2f}, Method: {method}){bbox_info}")
+        # Show action normalization if different
+        normalized_action = action
+        original_action = triplet.get('original_action', normalized_action)
+        action_display = normalized_action
+        if original_action != normalized_action:
+            action_display = f"{normalized_action} [{original_action} → {normalized_action}]"
+
+        print(f"  {i}. Human: '{human_text}' (R{human_region}) -> Action: '{action_display}' -> Object: '{object_text}' (R{object_region}){original_note} (Confidence: {confidence:.2f}, Method: {method}){bbox_info}")
 
     print()
 
     print(f"🔄 STEP 4: CONVERTING TO EVALUATION FORMAT...")
     # Convert triplets to evaluation format for testing
-    eval_dataset_type = dataset_type if dataset_type else 'hico'
     evaluation_predictions = hoi_extractor.convert_triplets_to_predictions(
         hoi_triplets, gt_data['image_id'] if gt_data else 0, original_width, original_height, eval_dataset_type
     )
