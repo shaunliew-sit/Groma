@@ -30,6 +30,21 @@ class HOIEvaluationOrchestrator:
         self.hoi_extractor = None
         self.evaluator = None
 
+        # Create timestamped output directory for this run
+        self.timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.timestamped_output_dir = None
+        if hasattr(args, 'output_dir') and args.output_dir:
+            # Create timestamped subfolder: output_dir/YYYY-MM-DD_HH-MM-SS/
+            self.timestamped_output_dir = os.path.join(args.output_dir, self.timestamp)
+            os.makedirs(self.timestamped_output_dir, exist_ok=True)
+            print(f"📁 Created timestamped output directory: {self.timestamped_output_dir}")
+
+            # Create organized subfolders within the timestamped directory
+            self.hoi_triplets_dir = os.path.join(self.timestamped_output_dir, "hoi_triplets")
+            self.comparison_dir = os.path.join(self.timestamped_output_dir, "comparison")
+            os.makedirs(self.hoi_triplets_dir, exist_ok=True)
+            os.makedirs(self.comparison_dir, exist_ok=True)
+
     def setup_model(self):
         """Setup the Groma model and related components."""
         print("🔧 Setting up model and processors...")
@@ -67,7 +82,8 @@ class HOIEvaluationOrchestrator:
 
     def setup_evaluator(self, dataset_type):
         """Setup the appropriate evaluator for the dataset."""
-        output_dir = getattr(self.args, 'output_dir', 'hoi_evaluation_output')
+        # Use timestamped output directory if available, otherwise fallback to original
+        output_dir = self.timestamped_output_dir or getattr(self.args, 'output_dir', 'hoi_evaluation_output')
 
         if dataset_type == 'hico':
             # HICO evaluator expects: anno_file, output_dir, zero_shot_type, ignore_non_interaction
@@ -164,23 +180,18 @@ class HOIEvaluationOrchestrator:
             )
 
         # Create visualizations
-        if hasattr(self.args, 'output_dir') and self.args.output_dir:
+        if self.timestamped_output_dir:
             visualizer = HOIVisualizer(raw_image)
 
-            # Create subfolders for organized output
-            hoi_triplets_dir = os.path.join(self.args.output_dir, "hoi_triplets")
-            comparison_dir = os.path.join(self.args.output_dir, "comparison")
-            os.makedirs(hoi_triplets_dir, exist_ok=True)
-            os.makedirs(comparison_dir, exist_ok=True)
-
+            # Use pre-created timestamped subfolders
             # Basic triplet visualization
-            viz_path = os.path.join(hoi_triplets_dir,
+            viz_path = os.path.join(self.hoi_triplets_dir,
                                   f"{os.path.splitext(os.path.basename(image_file))[0]}_hoi_triplets.jpg")
             visualizer.visualize_triplets(viz_triplets, coordinates_info, viz_path)
 
             # Comparison visualization (always create if GT data exists, even if 0 HOI annotations)
             if gt_data and dataset_type:
-                comp_path = os.path.join(comparison_dir,
+                comp_path = os.path.join(self.comparison_dir,
                                        f"{os.path.splitext(os.path.basename(image_file))[0]}_comparison.jpg")
                 visualizer.visualize_comparison(
                     viz_triplets, coordinates_info, gt_hois, metrics, comp_path, dataset_type
@@ -299,11 +310,6 @@ class HOIEvaluationOrchestrator:
 
     def save_comprehensive_results(self, all_predictions, dataset, console_metrics, detailed_results):
         """Save evaluation results to file."""
-        import datetime
-
-        # Get current timestamp
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
         # Create results structure
         results = {
             "processing_summary": {
@@ -313,13 +319,15 @@ class HOIEvaluationOrchestrator:
                 "success_rate_percent": round((len(all_predictions) / len(dataset)) * 100, 1)
             },
             "evaluation_metrics": console_metrics,
-            "successfully_processed_images": detailed_results
+            "successfully_processed_images": detailed_results,
+            "timestamp": self.timestamp,  # Include timestamp in results for reference
+            "output_directory": self.timestamped_output_dir
         }
 
-        # Save results file
-        if hasattr(self.args, 'output_dir') and self.args.output_dir:
+        # Save results file in timestamped directory
+        if self.timestamped_output_dir:
             dataset_name = getattr(self.args, 'dataset', 'unknown')
-            results_file = os.path.join(self.args.output_dir, f"{dataset_name}_evaluation_results_{timestamp}.json")
+            results_file = os.path.join(self.timestamped_output_dir, f"{dataset_name}_evaluation_results.json")
             with open(results_file, 'w') as f:
                 json.dump(results, f, indent=2)
             print(f"✅ Evaluation results saved: {results_file}")
