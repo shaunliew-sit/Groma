@@ -69,7 +69,7 @@ def eval_single_image(args):
         print(f"   Total Predictions: {metrics['total_predictions']}")
         print(f"   Total Ground Truth: {metrics['total_gt']}")
 
-    print(f"📁 Results saved to: {args.output_dir}")
+    print(f"📁 Results saved to timestamped directory: {orchestrator.timestamped_output_dir}")
     return result
 
 
@@ -97,7 +97,7 @@ def eval_dataset(args):
                 else:
                     print(f"     {metric}: {value}")
 
-    print(f"📁 Detailed results saved to: {args.output_dir}")
+    print(f"📁 Detailed results saved to timestamped directory: {orchestrator.timestamped_output_dir}")
     return result
 
 
@@ -154,7 +154,8 @@ def main():
     print("=" * 60)
     print(f"Model: {args.model_name}")
     print(f"Quantization: {args.quant_type}")
-    print(f"Output directory: {args.output_dir}")
+    print(f"Base output directory: {args.output_dir}")
+    print(f"📅 Each run creates a timestamped subfolder (YYYY-MM-DD_HH-MM-SS) to prevent overwriting")
 
     # Run appropriate evaluation mode
     if args.image_file:

@@ -56,6 +56,19 @@ class SWiGEvaluator(object):
         with open(os.path.join(self.output_dir, f"aps{ckpt_num}.pkl"), "wb") as f:
             pickle.dump({"aps": self.swig_ap, "eval_hoi_idxs": eval_hois, "zero_hoi_idxs": zero_hois, "rare_hoi_idxs": rare_hois, "nonrare_hoi_idxs": nonrare_hois}, f)
 
+        # Store metrics for JSON output (without changing original behavior)
+        self.last_metrics = {
+            "zero_shot_mAP": float(zero_mAP),
+            "rare_mAP": float(rare_mAP),
+            "nonrare_mAP": float(nonrare_mAP),
+            "full_mAP": float(full_mAP),
+            "zero_shot_mAP_percent": float(zero_mAP * 100.),
+            "rare_mAP_percent": float(rare_mAP * 100.),
+            "nonrare_mAP_percent": float(nonrare_mAP * 100.),
+            "full_mAP_percent": float(full_mAP * 100.),
+            "dataset_type": "SWIG-HOI"
+        }
+
     def save_preds(self):
         with open(os.path.join(self.output_dir, "preds.pkl"), "wb") as f:
             pickle.dump({"scores": self.scores, "boxes": self.boxes, "keys": self.keys}, f)

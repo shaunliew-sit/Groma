@@ -61,9 +61,23 @@ class HICOEvaluator(object):
             zero_shot_hois = np.setdiff1d(self.zero_shot_interaction_ids, [])
         zero_shot_mAP = np.mean(self.hico_ap[zero_shot_hois])
         seen_mAP = np.mean(self.hico_ap[seen_hois])
+        full_mAP = np.mean(self.hico_ap[valid_hois])
         print("zero-shot mAP: {:.2f}".format(zero_shot_mAP * 100.))
         print("seen mAP: {:.2f}".format(seen_mAP * 100.))
-        print("full mAP: {:.2f}".format(np.mean(self.hico_ap[valid_hois]) * 100.))
+        print("full mAP: {:.2f}".format(full_mAP * 100.))
+
+        # Store metrics for JSON output (without changing original behavior)
+        self.last_metrics = {
+            "zero_shot_mAP": float(zero_shot_mAP),
+            "seen_mAP": float(seen_mAP),
+            "full_mAP": float(full_mAP),
+            "zero_shot_mAP_percent": float(zero_shot_mAP * 100.),
+            "seen_mAP_percent": float(seen_mAP * 100.),
+            "full_mAP_percent": float(full_mAP * 100.),
+            "dataset_type": "HICO-DET",
+            "zero_shot_type": self.zero_shot_type,
+            "ignore_non_interaction": self.ignore_non_interaction
+        }
 
     def save_preds(self):
         with open(os.path.join(self.output_dir, "preds.pkl"), "wb") as f:

@@ -159,6 +159,17 @@ class HOIEvaluationOrchestrator:
 
         print(f"🔗 Extracted {len(triplets)} HOI triplets")
 
+        # Debug triplet details
+        triplets_with_bbox = sum(1 for t in triplets if t.get('human_bbox') and t.get('object_bbox'))
+        print(f"🔲 Triplets with valid bounding boxes: {triplets_with_bbox}/{len(triplets)}")
+        if len(triplets) > 0 and triplets_with_bbox == 0:
+            print("⚠️ WARNING: No triplets have bounding boxes - predictions will be empty")
+            print(f"🔍 Sample triplet keys: {list(triplets[0].keys()) if triplets else 'None'}")
+            if coordinates_info:
+                print(f"📍 Available coordinates: {len(coordinates_info)} regions")
+            else:
+                print("📍 No coordinate information available")
+
         # Prepare visualization triplets
         viz_triplets = self.hoi_extractor.prepare_visualization_triplets(
             triplets, dataset_type or 'hico'
@@ -171,6 +182,11 @@ class HOIEvaluationOrchestrator:
                 triplets, gt_data['image_id'] if gt_data else 0,
                 image_width, image_height, dataset_type
             )
+            print(f"🔄 Converted {len(triplets)} triplets to {len(predictions)} predictions")
+            if len(triplets) > 0 and len(predictions) == 0:
+                print("⚠️ WARNING: Triplets found but no predictions generated - check conversion logic")
+            elif len(predictions) > 0:
+                print(f"✅ Sample prediction format: {predictions[0] if predictions else 'None'}")
 
         # Calculate metrics if ground truth available
         metrics = None
@@ -283,16 +299,40 @@ class HOIEvaluationOrchestrator:
 
         # Final evaluation using official evaluator
         print(f"\n📊 Running final evaluation on {processed_count} processed images...")
+        print(f"🔢 Images with valid predictions: {len(all_predictions)}")
+
+        # Debug prediction statistics
+        if all_predictions:
+            total_preds = sum(len(preds) for preds in all_predictions.values())
+            avg_preds = total_preds / len(all_predictions) if all_predictions else 0
+            print(f"📈 Total predictions across all images: {total_preds}")
+            print(f"📊 Average predictions per image: {avg_preds:.1f}")
+
+            # Show sample predictions
+            sample_img_id = list(all_predictions.keys())[0]
+            sample_preds = all_predictions[sample_img_id][:3]  # First 3 predictions
+            print(f"🔍 Sample predictions from image {sample_img_id}:")
+            for i, pred in enumerate(sample_preds):
+                print(f"   [{i}] {pred}")
 
         # Update evaluator with all predictions (original script approach)
         if all_predictions:
+            print("Updating evaluator...")
             self.evaluator.update(all_predictions)
-
-            # Calculate final metrics
+            print("Computing metrics...")
             self.evaluator.accumulate()
-            console_metrics = self.evaluator.summarize()
+            self.evaluator.summarize()
+            # Save predictions
+            self.evaluator.save_preds()
+
+            # Capture mAP metrics for JSON output (stored by summarize())
+            console_metrics = getattr(self.evaluator, 'last_metrics', {})
+            if console_metrics:
+                print(f"📊 Captured mAP metrics for JSON output")
+            else:
+                print(f"⚠️  Warning: No mAP metrics available for JSON output")
         else:
-            print("No predictions to evaluate")
+            print("❌ No predictions to evaluate - all images failed prediction generation")
             console_metrics = {}
 
         # Save comprehensive results
