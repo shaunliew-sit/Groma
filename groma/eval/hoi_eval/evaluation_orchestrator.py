@@ -167,14 +167,20 @@ class HOIEvaluationOrchestrator:
         if hasattr(self.args, 'output_dir') and self.args.output_dir:
             visualizer = HOIVisualizer(raw_image)
 
+            # Create subfolders for organized output
+            hoi_triplets_dir = os.path.join(self.args.output_dir, "hoi_triplets")
+            comparison_dir = os.path.join(self.args.output_dir, "comparison")
+            os.makedirs(hoi_triplets_dir, exist_ok=True)
+            os.makedirs(comparison_dir, exist_ok=True)
+
             # Basic triplet visualization
-            viz_path = os.path.join(self.args.output_dir,
+            viz_path = os.path.join(hoi_triplets_dir,
                                   f"{os.path.splitext(os.path.basename(image_file))[0]}_hoi_triplets.jpg")
             visualizer.visualize_triplets(viz_triplets, coordinates_info, viz_path)
 
             # Comparison visualization (always create if GT data exists, even if 0 HOI annotations)
             if gt_data and dataset_type:
-                comp_path = os.path.join(self.args.output_dir,
+                comp_path = os.path.join(comparison_dir,
                                        f"{os.path.splitext(os.path.basename(image_file))[0]}_comparison.jpg")
                 visualizer.visualize_comparison(
                     viz_triplets, coordinates_info, gt_hois, metrics, comp_path, dataset_type
