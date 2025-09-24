@@ -230,7 +230,22 @@ class HOIEvaluationOrchestrator:
                     'triplets_found': len(result['triplets']),
                     'predictions_count': len(result['predictions']),
                     'gt_count': len(result['ground_truth']),
-                    'metrics': result['metrics']
+                    'metrics': result['metrics'],
+                    'extracted_hoi_triplets': [
+                        {
+                            'human': triplet['human']['text'],
+                            'human_region_id': triplet['human']['region_id'],
+                            'action': triplet['action'],
+                            'original_action': triplet.get('original_action', triplet['action']),
+                            'object': triplet['object']['text'],
+                            'object_region_id': triplet['object']['region_id'],
+                            'confidence': triplet.get('confidence', 0.0),
+                            'mapping_status': triplet.get('mapping_status', 'unknown'),
+                            'hoi_id': triplet.get('hoi_id'),
+                            'evaluation_eligible': triplet.get('evaluation_eligible', False)
+                        }
+                        for triplet in result['triplets']
+                    ]
                 }
 
                 processed_count += 1
