@@ -23,3 +23,8 @@ output
 
 checkpoints
 ckpts*
+
+data_images/
+data
+swig_full_eval
+hico_full_eval
