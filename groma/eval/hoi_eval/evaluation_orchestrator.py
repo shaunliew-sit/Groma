@@ -325,6 +325,7 @@ class HOIEvaluationOrchestrator:
                     # Load ground truth for this image
                     gt_data = data_item  # Dataset already includes ground truth
                     gt_hois = extract_ground_truth_hois(gt_data, dataset_type)
+                    print(f"DEBUG: Orchestrator loaded {len(gt_hois)} ground truth HOIs for image {image_id}")
 
                     # Extract HOI triplets
                     entities = self.hoi_extractor.parse_grounded_response(response_text)
@@ -342,8 +343,16 @@ class HOIEvaluationOrchestrator:
 
                     # Calculate metrics
                     metrics = None
+                    print(f"DEBUG: Before metrics calculation - gt_hois: {len(gt_hois)}, predictions: {len(predictions)}")
+                    if gt_hois:
+                        print(f"DEBUG: Ground truth HOI IDs: {[gt['hoi_id'] for gt in gt_hois]}")
+                    if predictions:
+                        print(f"DEBUG: Prediction HOI IDs: {[pred[0] for pred in predictions]}")
                     if gt_hois and predictions:
+                        print(f"DEBUG: Calling calculate_single_image_metrics with {len(gt_hois)} gt_hois and {len(predictions)} predictions")
                         metrics = calculate_single_image_metrics(predictions, gt_hois, image_width, image_height)
+                    else:
+                        print(f"DEBUG: Skipping metrics calculation - gt_hois: {len(gt_hois)}, predictions: {len(predictions)}")
 
                     # Store predictions for final evaluation
                     if predictions:
