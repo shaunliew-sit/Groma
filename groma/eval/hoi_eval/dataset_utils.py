@@ -45,12 +45,16 @@ def load_hico_dataset(data_root, max_images=None):
     for ann in annotations:
         img_path = os.path.join(test_img_dir, ann['file_name'])
         if os.path.exists(img_path):
+            # Include ALL annotation data in the dataset item
             dataset.append({
                 'image_id': ann['img_id'],
                 'image_path': img_path,
                 'file_name': ann['file_name'],
                 'width': ann.get('width', 640),
-                'height': ann.get('height', 480)
+                'height': ann.get('height', 480),
+                # CRITICAL: Include ground truth annotations
+                'annotations': ann.get('annotations', []),
+                'hoi_annotation': ann.get('hoi_annotation', [])
             })
 
     print(f"DEBUG: Successfully loaded {len(dataset)} valid HICO images")
@@ -86,12 +90,16 @@ def load_swig_dataset(data_root, max_images=None):
     for ann in annotations:
         img_path = os.path.join(test_img_dir, ann['file_name'])
         if os.path.exists(img_path):
+            # Include ALL annotation data in the dataset item
             dataset.append({
                 'image_id': ann['img_id'],
                 'image_path': img_path,
                 'file_name': ann['file_name'],
                 'width': ann.get('width', 512),
-                'height': ann.get('height', 512)
+                'height': ann.get('height', 512),
+                # CRITICAL: Include ground truth annotations
+                'box_annotations': ann.get('box_annotations', []),
+                'hoi_annotations': ann.get('hoi_annotations', [])
             })
 
     print(f"DEBUG: Successfully loaded {len(dataset)} valid SWIG images")
