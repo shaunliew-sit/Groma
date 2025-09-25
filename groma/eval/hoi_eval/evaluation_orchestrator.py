@@ -4,6 +4,7 @@ import os
 import json
 import datetime
 import torch
+import numpy as np
 from transformers import AutoTokenizer, AutoImageProcessor, BitsAndBytesConfig
 
 from groma.utils import disable_torch_init
@@ -437,14 +438,64 @@ class HOIEvaluationOrchestrator:
             self.evaluator.update(all_predictions)
             print("Computing metrics...")
             self.evaluator.accumulate()
+
+            # Calculate console metrics manually BEFORE summarize() for consistency with printed output
+            # This matches the backup code approach and ensures consistency between printed and JSON metrics
+            console_metrics = {}
+            if hasattr(self.evaluator, 'swig_ap'):  # SWIG dataset
+                from .swig_v1_categories import SWIG_INTERACTIONS
+                eval_hois = np.asarray([x["id"] for x in SWIG_INTERACTIONS if x["evaluation"] == 1])
+                zero_hois = np.asarray([x["id"] for x in SWIG_INTERACTIONS if x["evaluation"] == 1 and x["frequency"] == 0])
+                rare_hois = np.asarray([x["id"] for x in SWIG_INTERACTIONS if x["frequency"] == 1 and x["evaluation"] == 1])
+                nonrare_hois = np.asarray([x["id"] for x in SWIG_INTERACTIONS if x["frequency"] == 2 and x["evaluation"] == 1])
+
+                # Calculate metrics with same precision as displayed
+                zero_shot_mAP = np.mean(self.evaluator.swig_ap[zero_hois])
+                rare_mAP = np.mean(self.evaluator.swig_ap[rare_hois])
+                nonrare_mAP = np.mean(self.evaluator.swig_ap[nonrare_hois])
+                full_mAP = np.mean(self.evaluator.swig_ap[eval_hois])
+
+                console_metrics = {
+                    "zero_shot_mAP": float(zero_shot_mAP),
+                    "rare_mAP": float(rare_mAP),
+                    "nonrare_mAP": float(nonrare_mAP),
+                    "full_mAP": float(full_mAP),
+                    "zero_shot_mAP_percent": float(zero_shot_mAP * 100),
+                    "rare_mAP_percent": float(rare_mAP * 100),
+                    "nonrare_mAP_percent": float(nonrare_mAP * 100),
+                    "full_mAP_percent": float(full_mAP * 100),
+                    "dataset_type": "SWIG-HOI"
+                }
+            elif hasattr(self.evaluator, 'hico_ap'):  # HICO dataset
+                valid_hois = np.nonzero(self.evaluator.hico_rec)[0]
+                if self.evaluator.zero_shot_interaction_ids is not None:
+                    seen_hois = np.setdiff1d(valid_hois, self.evaluator.zero_shot_interaction_ids)
+                    zero_shot_hois = np.setdiff1d(self.evaluator.zero_shot_interaction_ids, [])
+                else:
+                    seen_hois = valid_hois
+                    zero_shot_hois = []
+
+                zero_shot_mAP = np.mean(self.evaluator.hico_ap[zero_shot_hois]) if len(zero_shot_hois) > 0 else 0.0
+                seen_mAP = np.mean(self.evaluator.hico_ap[seen_hois]) if len(seen_hois) > 0 else 0.0
+                full_mAP = np.mean(self.evaluator.hico_ap[valid_hois]) if len(valid_hois) > 0 else 0.0
+
+                console_metrics = {
+                    "zero_shot_mAP": float(zero_shot_mAP),
+                    "seen_mAP": float(seen_mAP),
+                    "full_mAP": float(full_mAP),
+                    "zero_shot_mAP_percent": float(zero_shot_mAP * 100),
+                    "seen_mAP_percent": float(seen_mAP * 100),
+                    "full_mAP_percent": float(full_mAP * 100),
+                    "dataset_type": "HICO-DET"
+                }
+
+            # Now call summarize() - this will print the rounded values for console display
             self.evaluator.summarize()
             # Save predictions
             self.evaluator.save_preds()
 
-            # Capture mAP metrics for JSON output (stored by summarize())
-            console_metrics = getattr(self.evaluator, 'last_metrics', {})
             if console_metrics:
-                print(f"📊 Captured mAP metrics for JSON output")
+                print(f"📊 Captured mAP metrics for JSON output (full precision matches printed values)")
             else:
                 print(f"⚠️  Warning: No mAP metrics available for JSON output")
         else:
