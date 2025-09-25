@@ -223,7 +223,7 @@ class HOIEvaluationOrchestrator:
         }
 
     def evaluate_dataset(self, dataset_type, data_root, max_images=None, batch_size=1):
-        """Evaluate an entire dataset."""
+        """Evaluate an entire dataset with batch processing."""
         print(f"\n{'='*80}")
         print(f"DATASET EVALUATION: {dataset_type.upper()}")
         print(f"{'='*80}")
@@ -238,54 +238,170 @@ class HOIEvaluationOrchestrator:
         # Setup evaluator
         self.setup_evaluator(dataset_type)
 
+        # Memory management and batch size adjustment
+        if torch.cuda.is_available():
+            total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            allocated_memory = torch.cuda.memory_allocated() / 1024**3
+            free_memory = total_memory - allocated_memory
+
+            print(f"GPU Memory info: Total: {total_memory:.2f} GB, Allocated: {allocated_memory:.2f} GB, Free: {free_memory:.2f} GB")
+
+            # Adjust batch size based on available memory
+            if free_memory < 4.0 and batch_size > 4:
+                batch_size = 4
+                print(f"⚠️  Reducing batch size to {batch_size} due to limited GPU memory")
+            elif free_memory < 2.0 and batch_size > 2:
+                batch_size = 2
+                print(f"⚠️  Reducing batch size to {batch_size} due to very limited GPU memory")
+            elif free_memory < 1.0:
+                batch_size = 1
+                print(f"⚠️  Reducing batch size to {batch_size} due to extremely limited GPU memory")
+
+            torch.cuda.empty_cache()
+
+        print(f"Starting evaluation on {len(dataset)} images with batch size {batch_size}...")
+
         all_predictions = {}
         detailed_results = {}
         processed_count = 0
 
-        # Process images
-        for i, data_item in enumerate(dataset):
+        # HOI query prompt
+        hoi_query = "[grounding] Describe what each person is doing with objects individually. Focus on actions only."
+
+        # Process dataset in batches
+        from tqdm import tqdm
+        num_batches = (len(dataset) + batch_size - 1) // batch_size
+        progress_bar = tqdm(total=len(dataset), desc=f"Processing {dataset_type.upper()} images")
+
+        for batch_idx in range(num_batches):
+            batch_start = batch_idx * batch_size
+            batch_end = min(batch_start + batch_size, len(dataset))
+            batch_samples = dataset[batch_start:batch_end]
+
             try:
-                image_id = data_item['image_id']
-                image_path = data_item['image_path']
+                print(f"\n🔄 Processing batch {batch_idx + 1}/{num_batches} (images {batch_start + 1}-{batch_end})")
 
-                print(f"\n[{i+1}/{len(dataset)}] Processing image {image_id}: {os.path.basename(image_path)}")
+                # Load and preprocess images in batch
+                batch_images = []
+                batch_image_info = []
 
-                # Use single image evaluation
-                result = self.evaluate_single_image(image_path, dataset_type, data_root)
+                for data_item in batch_samples:
+                    image_path = data_item['image_path']
+                    raw_image = load_image(image_path)
 
-                # Store predictions for final evaluation
-                if result['predictions']:
-                    all_predictions[image_id] = result['predictions']
+                    # Resize to 448x448 (square) as required by Groma model
+                    processed_image = raw_image.resize((448, 448))
+                    image_processed = self.vis_processor.preprocess(processed_image, return_tensors='pt')['pixel_values'][0]
+                    image_tensor = image_processed.unsqueeze(0)
 
-                # Store detailed results
-                detailed_results[image_id] = {
-                    'file_name': os.path.basename(image_path),
-                    'triplets_found': len(result['triplets']),
-                    'predictions_count': len(result['predictions']),
-                    'gt_count': len(result['ground_truth']),
-                    'metrics': result['metrics'],
-                    'extracted_hoi_triplets': [
-                        {
-                            'human': triplet['human']['text'],
-                            'human_region_id': triplet['human']['region_id'],
-                            'action': triplet['action'],
-                            'original_action': triplet.get('original_action', triplet['action']),
-                            'object': triplet['object']['text'],
-                            'object_region_id': triplet['object']['region_id'],
-                            'confidence': triplet.get('confidence', 0.0),
-                            'mapping_status': triplet.get('mapping_status', 'unknown'),
-                            'hoi_id': triplet.get('hoi_id'),
-                            'evaluation_eligible': triplet.get('evaluation_eligible', False)
-                        }
-                        for triplet in result['triplets']
-                    ]
-                }
+                    batch_images.append(image_tensor)
+                    batch_image_info.append({
+                        'data_item': data_item,
+                        'raw_image': raw_image,
+                        'image_width': raw_image.size[0],
+                        'image_height': raw_image.size[1]
+                    })
 
-                processed_count += 1
+                # Move batch to GPU
+                batch_images = [img.cuda() for img in batch_images]
+
+                # Generate responses for the batch
+                batch_results = generate_hoi_response_batch(
+                    self.model, self.tokenizer, self.vis_processor, batch_images, hoi_query, batch_size=len(batch_images)
+                )
+
+                # Process each result in the batch
+                for i, (response_text, coordinates_info) in enumerate(batch_results):
+                    data_item = batch_image_info[i]['data_item']
+                    raw_image = batch_image_info[i]['raw_image']
+                    image_width = batch_image_info[i]['image_width']
+                    image_height = batch_image_info[i]['image_height']
+                    image_id = data_item['image_id']
+                    image_path = data_item['image_path']
+
+                    print(f"  [{batch_start + i + 1}/{len(dataset)}] Processing image {image_id}: {os.path.basename(image_path)}")
+
+                    # Load ground truth for this image
+                    gt_data = data_item  # Dataset already includes ground truth
+                    gt_hois = extract_ground_truth_hois(gt_data, dataset_type)
+
+                    # Extract HOI triplets
+                    entities = self.hoi_extractor.parse_grounded_response(response_text)
+                    triplets = self.hoi_extractor.extract_hoi_triplets(
+                        response_text, entities, coordinates_info, dataset_type
+                    )
+
+                    # Prepare visualization triplets
+                    viz_triplets = self.hoi_extractor.prepare_visualization_triplets(triplets, dataset_type)
+
+                    # Convert to predictions for evaluation
+                    predictions = self.hoi_extractor.convert_triplets_to_predictions(
+                        triplets, image_id, image_width, image_height, dataset_type
+                    )
+
+                    # Calculate metrics
+                    metrics = None
+                    if gt_hois and predictions:
+                        metrics = calculate_single_image_metrics(predictions, gt_hois, image_width, image_height)
+
+                    # Store predictions for final evaluation
+                    if predictions:
+                        all_predictions[image_id] = predictions
+
+                    # Create visualizations
+                    if self.timestamped_output_dir:
+                        visualizer = HOIVisualizer(raw_image)
+
+                        # Basic triplet visualization
+                        viz_path = os.path.join(self.hoi_triplets_dir,
+                                             f"{os.path.splitext(os.path.basename(image_path))[0]}_hoi_triplets.jpg")
+                        visualizer.visualize_triplets(viz_triplets, coordinates_info, viz_path)
+
+                        # Comparison visualization
+                        comp_path = os.path.join(self.comparison_dir,
+                                               f"{os.path.splitext(os.path.basename(image_path))[0]}_comparison.jpg")
+                        visualizer.visualize_comparison(
+                            viz_triplets, coordinates_info, gt_hois, metrics, comp_path, dataset_type
+                        )
+
+                    # Store detailed results
+                    detailed_results[image_id] = {
+                        'file_name': os.path.basename(image_path),
+                        'triplets_found': len(viz_triplets),
+                        'predictions_count': len(predictions),
+                        'gt_count': len(gt_hois),
+                        'metrics': metrics,
+                        'extracted_hoi_triplets': [
+                            {
+                                'human': triplet['human']['text'],
+                                'human_region_id': triplet['human']['region_id'],
+                                'action': triplet['action'],
+                                'original_action': triplet.get('original_action', triplet['action']),
+                                'object': triplet['object']['text'],
+                                'object_region_id': triplet['object']['region_id'],
+                                'confidence': triplet.get('confidence', 0.0),
+                                'mapping_status': triplet.get('mapping_status', 'unknown'),
+                                'hoi_id': triplet.get('hoi_id'),
+                                'evaluation_eligible': triplet.get('evaluation_eligible', False)
+                            }
+                            for triplet in viz_triplets
+                        ]
+                    }
+
+                    processed_count += 1
+                    progress_bar.update(1)
+
+                # Memory cleanup after batch
+                torch.cuda.empty_cache()
 
             except Exception as e:
-                print(f"❌ Error processing image {data_item['image_id']}: {str(e)}")
+                print(f"❌ Error processing batch {batch_idx + 1}: {str(e)}")
+                # Skip failed images in batch and continue with next batch
+                for j in range(len(batch_samples)):
+                    progress_bar.update(1)
                 continue
+
+        progress_bar.close()
 
         # Display processing summary (matching original script format)
         print(f"\n{'='*50}")
