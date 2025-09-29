@@ -4,12 +4,19 @@ import json
 import os
 import pickle
 from .hico_categories import HICO_INTERACTIONS, HICO_ACTIONS, HICO_OBJECTS
-from .hico_categories import ZERO_SHOT_INTERACTION_IDS, NON_INTERACTION_IDS, hico_unseen_index
 
 
 class HICOEvaluator(object):
     ''' Evaluator for HICO-DET dataset '''
-    def __init__(self, anno_file, output_dir, zero_shot_type, ignore_non_interaction):
+    def __init__(self, anno_file, output_dir, evaluation_mode='default'):
+        """
+        Initialize HICO evaluator with paper-standard protocol
+
+        Args:
+            anno_file: Path to annotation file
+            output_dir: Output directory for results
+            evaluation_mode: 'default' for now (future: 'known_objects')
+        """
         size = 600
         self.size = size
         self.gts = self.load_anno(anno_file)
@@ -19,9 +26,25 @@ class HICOEvaluator(object):
         self.hico_ap  = np.zeros(size)
         self.hico_rec = np.zeros(size)
         self.output_dir = output_dir
-        self.zero_shot_type = zero_shot_type
-        self.zero_shot_interaction_ids = hico_unseen_index[zero_shot_type]
-        self.ignore_non_interaction = ignore_non_interaction
+        self.evaluation_mode = evaluation_mode
+
+    def get_rare_non_rare_categories_paper_standard(self):
+        """
+        Follow CVPR 2024 paper specification:
+        - 138 Rare interactions (< 10 training instances)
+        - 462 Non-Rare interactions (≥ 10 training instances)
+        - 600 Total interactions (includes no_interaction categories)
+
+        Returns:
+            tuple: (rare_ids, non_rare_ids, valid_ids)
+        """
+        from .hico_categories import RARE_INTERACTION_IDS
+
+        rare_ids = set(RARE_INTERACTION_IDS)      # 138 categories
+        all_ids = set(range(600))                 # All 600 categories
+        non_rare_ids = all_ids - rare_ids         # 462 categories
+
+        return rare_ids, non_rare_ids, all_ids
 
     def update(self, predictions):
         ''' Store predictions
@@ -51,32 +74,44 @@ class HICOEvaluator(object):
             self.hico_ap[hoi_id], self.hico_rec[hoi_id] = ap, rec
 
     def summarize(self, ckpt_num=""):
-        if self.ignore_non_interaction:
-            valid_hois = np.setdiff1d(np.arange(600), NON_INTERACTION_IDS)
-            seen_hois = np.setdiff1d(valid_hois, self.zero_shot_interaction_ids)
-            zero_shot_hois = np.setdiff1d(self.zero_shot_interaction_ids, NON_INTERACTION_IDS)
-        else:
-            valid_hois = np.setdiff1d(np.arange(600), [])
-            seen_hois = np.setdiff1d(valid_hois, self.zero_shot_interaction_ids)
-            zero_shot_hois = np.setdiff1d(self.zero_shot_interaction_ids, [])
-        zero_shot_mAP = np.mean(self.hico_ap[zero_shot_hois])
-        seen_mAP = np.mean(self.hico_ap[seen_hois])
-        full_mAP = np.mean(self.hico_ap[valid_hois])
-        print("zero-shot mAP: {:.2f}".format(zero_shot_mAP * 100.))
-        print("seen mAP: {:.2f}".format(seen_mAP * 100.))
-        print("full mAP: {:.2f}".format(full_mAP * 100.))
+        """
+        Calculate metrics following paper-standard protocol:
+        138 Rare + 462 Non-Rare = 600 Total
+        """
+        rare_ids, non_rare_ids, valid_ids = self.get_rare_non_rare_categories_paper_standard()
 
-        # Store metrics for JSON output (without changing original behavior)
+        # Convert to numpy arrays for indexing
+        rare_hois = np.array(list(rare_ids))
+        non_rare_hois = np.array(list(non_rare_ids))
+        valid_hois = np.array(list(valid_ids))
+
+        # Calculate mAP for each category
+        rare_mAP = np.mean(self.hico_ap[rare_hois])
+        non_rare_mAP = np.mean(self.hico_ap[non_rare_hois])
+        full_mAP = np.mean(self.hico_ap[valid_hois])
+
+        # Print results
+        print(f"{self.evaluation_mode.upper()} SETTING (Paper-Standard Protocol):")
+        print("Full mAP: {:.4f} ({:.2f}%) - 600 categories".format(full_mAP, full_mAP * 100.))
+        print("Rare mAP: {:.4f} ({:.2f}%) - 138 categories".format(rare_mAP, rare_mAP * 100.))
+        print("Non-Rare mAP: {:.4f} ({:.2f}%) - 462 categories".format(non_rare_mAP, non_rare_mAP * 100.))
+
+        # Store metrics for JSON output
         self.last_metrics = {
-            "zero_shot_mAP": float(zero_shot_mAP),
-            "seen_mAP": float(seen_mAP),
-            "full_mAP": float(full_mAP),
-            "zero_shot_mAP_percent": float(zero_shot_mAP * 100.),
-            "seen_mAP_percent": float(seen_mAP * 100.),
-            "full_mAP_percent": float(full_mAP * 100.),
-            "dataset_type": "HICO-DET",
-            "zero_shot_type": self.zero_shot_type,
-            "ignore_non_interaction": self.ignore_non_interaction
+            "evaluation_mode": self.evaluation_mode,
+            "protocol": "paper_standard",
+            self.evaluation_mode: {
+                "full_mAP": float(full_mAP),
+                "rare_mAP": float(rare_mAP),
+                "non_rare_mAP": float(non_rare_mAP),
+                "full_mAP_percent": float(full_mAP * 100.),
+                "rare_mAP_percent": float(rare_mAP * 100.),
+                "non_rare_mAP_percent": float(non_rare_mAP * 100.),
+                "rare_count": 138,
+                "non_rare_count": 462,
+                "total_count": 600
+            },
+            "dataset_type": "HICO-DET"
         }
 
     def save_preds(self):

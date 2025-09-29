@@ -87,9 +87,10 @@ class HOIEvaluationOrchestrator:
         output_dir = self.timestamped_output_dir or getattr(self.args, 'output_dir', 'hoi_evaluation_output')
 
         if dataset_type == 'hico':
-            # HICO evaluator expects: anno_file, output_dir, zero_shot_type, ignore_non_interaction
+            # HICO evaluator expects: anno_file, output_dir, evaluation_mode
             anno_file = os.path.join(self.args.data_root, 'annotations', 'test_hico_ann.json')
-            self.evaluator = HICOEvaluator(anno_file, output_dir, 'uc0', True)
+            evaluation_mode = getattr(self.args, 'evaluation_mode', 'default')
+            self.evaluator = HICOEvaluator(anno_file, output_dir, evaluation_mode=evaluation_mode)
         elif dataset_type == 'swig':
             # SWIG evaluator expects: anno_file, output_dir
             anno_file = os.path.join(self.args.data_root, 'annotations', 'swig_test_1000.json')
@@ -476,30 +477,11 @@ class HOIEvaluationOrchestrator:
                     "dataset_type": "SWIG-HOI"
                 }
             elif hasattr(self.evaluator, 'hico_ap'):  # HICO dataset
-                valid_hois = np.nonzero(self.evaluator.hico_rec)[0]
-                if self.evaluator.zero_shot_interaction_ids is not None:
-                    seen_hois = np.setdiff1d(valid_hois, self.evaluator.zero_shot_interaction_ids)
-                    zero_shot_hois = np.setdiff1d(self.evaluator.zero_shot_interaction_ids, [])
-                else:
-                    seen_hois = valid_hois
-                    zero_shot_hois = []
+                # Call summarize() first - this will calculate and set last_metrics
+                self.evaluator.summarize()
+                # Now get the metrics that were just calculated
+                console_metrics = getattr(self.evaluator, 'last_metrics', {})
 
-                zero_shot_mAP = np.mean(self.evaluator.hico_ap[zero_shot_hois]) if len(zero_shot_hois) > 0 else 0.0
-                seen_mAP = np.mean(self.evaluator.hico_ap[seen_hois]) if len(seen_hois) > 0 else 0.0
-                full_mAP = np.mean(self.evaluator.hico_ap[valid_hois]) if len(valid_hois) > 0 else 0.0
-
-                console_metrics = {
-                    "zero_shot_mAP": float(zero_shot_mAP),
-                    "seen_mAP": float(seen_mAP),
-                    "full_mAP": float(full_mAP),
-                    "zero_shot_mAP_percent": float(zero_shot_mAP * 100),
-                    "seen_mAP_percent": float(seen_mAP * 100),
-                    "full_mAP_percent": float(full_mAP * 100),
-                    "dataset_type": "HICO-DET"
-                }
-
-            # Now call summarize() - this will print the rounded values for console display
-            self.evaluator.summarize()
             # Save predictions
             self.evaluator.save_preds()
 

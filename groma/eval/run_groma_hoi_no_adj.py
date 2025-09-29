@@ -137,6 +137,11 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8,
                        help="Batch size for processing images (default: 8)")
 
+    # Evaluation protocol settings
+    parser.add_argument("--evaluation-mode", type=str, choices=['default', 'known_objects'],
+                       default='default',
+                       help="Evaluation mode: 'default' (predict all boxes + interactions) or 'known_objects' (use GT object boxes)")
+
     args = parser.parse_args()
 
     # Validate arguments
