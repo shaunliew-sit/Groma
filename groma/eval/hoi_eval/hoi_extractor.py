@@ -44,6 +44,12 @@ class POSBasedHOIExtractorNoAdj:
         self.hico_hoi_mapper = self._build_hico_hoi_mapper()
         self.swig_hoi_mapper = self._build_swig_hoi_mapper()
 
+    def _convert_spaces_to_underscores(self, text):
+        """Convert multi-word text to underscore format (e.g., 'traffic light' -> 'traffic_light')"""
+        if not text:
+            return text
+        return text.replace(' ', '_')
+
     def remove_adjectives_from_object(self, text):
         """Remove adjectives from object descriptions while preserving essential nouns"""
         if not self.nlp:
@@ -135,6 +141,8 @@ class POSBasedHOIExtractorNoAdj:
             # Apply adjective removal only to objects
             if entity_type == 'object':
                 processed_text = self.remove_adjectives_from_object(original_text)
+                # Convert multi-word objects to underscore format (e.g., "traffic light" -> "traffic_light")
+                processed_text = self._convert_spaces_to_underscores(processed_text)
             else:
                 processed_text = original_text
 
@@ -841,6 +849,9 @@ class POSBasedHOIExtractorNoAdj:
                     normalized_action = self._normalize_action_for_swig(original_action)
                 else:
                     normalized_action = original_action
+
+                # Convert multi-word actions to underscore format (e.g., "sit on" -> "sit_on")
+                normalized_action = self._convert_spaces_to_underscores(normalized_action)
 
                 # Create triplet with normalized action as primary
                 triplet = {
@@ -1733,6 +1744,9 @@ class POSBasedHOIExtractorNoAdj:
                 normalized_action = self._normalize_action_for_swig(original_action)
             else:
                 normalized_action = original_action
+
+            # Convert multi-word actions to underscore format (e.g., "sit on" -> "sit_on")
+            normalized_action = self._convert_spaces_to_underscores(normalized_action)
 
             triplet = {
                 'human': human_entity,
