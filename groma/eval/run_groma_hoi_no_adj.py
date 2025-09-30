@@ -138,9 +138,9 @@ def main():
                        help="Batch size for processing images (default: 8)")
 
     # Evaluation protocol settings
-    parser.add_argument("--evaluation-mode", type=str, choices=['default', 'known_objects'],
+    parser.add_argument("--evaluation-mode", type=str, choices=['default', 'known_object'],
                        default='default',
-                       help="Evaluation mode: 'default' (predict all boxes + interactions) or 'known_objects' (use GT object boxes)")
+                       help="Evaluation mode: 'default' (evaluate on all test images) or 'known_object' (evaluate only on images containing the target object)")
 
     args = parser.parse_args()
 
@@ -159,6 +159,12 @@ def main():
     print("=" * 60)
     print(f"Model: {args.model_name}")
     print(f"Quantization: {args.quant_type}")
+    print(f"Evaluation Mode: {args.evaluation_mode.upper()}")
+    if args.evaluation_mode == 'known_object':
+        print("  ℹ️  Known Object: Filters test set to only images containing the target object")
+        print("  ℹ️  (e.g., for 'ride bicycle', only evaluate on images that have bicycles)")
+    else:
+        print("  ℹ️  Default: Evaluates on ALL test images (harder - includes background rejection)")
     print(f"Base output directory: {args.output_dir}")
     print(f"📅 Each run creates a timestamped subfolder (YYYY-MM-DD_HH-MM-SS) to prevent overwriting")
 

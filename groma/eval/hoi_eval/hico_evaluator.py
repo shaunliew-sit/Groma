@@ -15,10 +15,13 @@ class HICOEvaluator(object):
         Args:
             anno_file: Path to annotation file
             output_dir: Output directory for results
-            evaluation_mode: 'default' for now (future: 'known_objects')
+            evaluation_mode: 'default' or 'known_object'
+                - 'default': Evaluate on all test images (harder, includes background rejection)
+                - 'known_object': Evaluate only on images containing target object (easier, focuses on interaction)
         """
         size = 600
         self.size = size
+        self.anno_file = anno_file
         self.gts = self.load_anno(anno_file)
         self.scores = {i: [] for i in range(size)}
         self.boxes = {i: [] for i in range(size)}
@@ -27,6 +30,17 @@ class HICOEvaluator(object):
         self.hico_rec = np.zeros(size)
         self.output_dir = output_dir
         self.evaluation_mode = evaluation_mode
+
+        # Build image-object index for known_object mode
+        self.object_to_images = {}  # {object_coco_id: [list of image_ids]}
+        self.image_to_objects = {}  # {image_id: [list of object_coco_ids]}
+        self.hoi_to_object_id = {}  # {hoi_id: object_coco_id}
+
+        if evaluation_mode == 'known_object':
+            print(f"🔍 Building image-object index for Known Object evaluation mode...")
+            self.object_to_images, self.image_to_objects = self.build_image_object_index(anno_file)
+            self.hoi_to_object_id = self.build_hoi_to_object_mapping()
+            print(f"✅ Image-object index built: {len(self.image_to_objects)} images, {len(self.object_to_images)} object types")
 
     def get_rare_non_rare_categories_paper_standard(self):
         """
@@ -45,6 +59,69 @@ class HICOEvaluator(object):
         non_rare_ids = all_ids - rare_ids         # 462 categories
 
         return rare_ids, non_rare_ids, all_ids
+
+    def build_image_object_index(self, anno_file):
+        """
+        Build mappings between images and objects for Known Object evaluation.
+
+        This creates an index to determine which test images contain which objects.
+        Used to filter the test set per HOI category in Known Object mode.
+
+        Returns:
+            object_to_images: {object_coco_id: [list of image_ids with that object]}
+            image_to_objects: {image_id: [list of object_coco_ids in that image]}
+        """
+        with open(anno_file, 'r') as f:
+            dataset_dicts = json.load(f)
+
+        image_to_objects = {}
+        object_to_images = collections.defaultdict(list)
+
+        for anno_dict in dataset_dicts:
+            image_id = anno_dict['img_id']
+            box_annos = anno_dict.get('annotations', [])
+
+            # Extract all object categories in this image
+            objects_in_image = []
+            for box_anno in box_annos:
+                obj_category_id = box_anno['category_id']
+                objects_in_image.append(obj_category_id)
+
+            # Store mapping
+            image_to_objects[image_id] = list(set(objects_in_image))  # Remove duplicates
+
+            # Build reverse mapping
+            for obj_id in set(objects_in_image):
+                object_to_images[obj_id].append(image_id)
+
+        # Convert to regular dict and remove duplicates in lists
+        object_to_images = {k: list(set(v)) for k, v in object_to_images.items()}
+
+        return object_to_images, image_to_objects
+
+    def build_hoi_to_object_mapping(self):
+        """
+        Build mapping from HOI ID to object COCO ID.
+
+        Returns:
+            hoi_to_object_id: {hoi_id: object_coco_id}
+        """
+        # Create object name to COCO ID mapping
+        object_name_to_id = {obj['name']: obj['id'] for obj in HICO_OBJECTS}
+
+        # Map each HOI to its target object COCO ID
+        hoi_to_object_id = {}
+        for interaction in HICO_INTERACTIONS:
+            hoi_id = interaction['interaction_id']
+            object_name = interaction['object']
+            object_coco_id = object_name_to_id.get(object_name)
+
+            if object_coco_id is not None:
+                hoi_to_object_id[hoi_id] = object_coco_id
+            else:
+                print(f"Warning: Object '{object_name}' not found in HICO_OBJECTS mapping")
+
+        return hoi_to_object_id
 
     def update(self, predictions):
         ''' Store predictions
@@ -68,10 +145,39 @@ class HICOEvaluator(object):
                 self.keys[hoi_id].append(img_id)
 
     def accumulate(self):
-        for hoi_id in range(600):
-            gts_per_hoi = self.gts[hoi_id]
-            ap, rec = calc_ap(self.scores[hoi_id], self.boxes[hoi_id], self.keys[hoi_id], gts_per_hoi)
-            self.hico_ap[hoi_id], self.hico_rec[hoi_id] = ap, rec
+        """Calculate AP for all HOI categories using the specified evaluation mode"""
+        if self.evaluation_mode == 'known_object':
+            # Known Object mode: Only evaluate on images that contain the target object
+            # This filters the test set per HOI category (easier task, focuses on interaction)
+            for hoi_id in range(600):
+                gts_per_hoi = self.gts[hoi_id]
+
+                # Get target object COCO ID for this HOI
+                target_object_id = self.hoi_to_object_id.get(hoi_id)
+
+                if target_object_id is None:
+                    # If no object mapping (shouldn't happen), fall back to default
+                    ap, rec = calc_ap(self.scores[hoi_id], self.boxes[hoi_id], self.keys[hoi_id], gts_per_hoi)
+                else:
+                    # Get images containing this object (filtered test set)
+                    valid_image_ids = set(self.object_to_images.get(target_object_id, []))
+
+                    # Calculate AP only on images containing the target object
+                    ap, rec = calc_ap_known_object(
+                        self.scores[hoi_id],
+                        self.boxes[hoi_id],
+                        self.keys[hoi_id],
+                        gts_per_hoi,
+                        valid_image_ids
+                    )
+
+                self.hico_ap[hoi_id], self.hico_rec[hoi_id] = ap, rec
+        else:
+            # Default mode: Evaluate on ALL test images (harder task, includes background rejection)
+            for hoi_id in range(600):
+                gts_per_hoi = self.gts[hoi_id]
+                ap, rec = calc_ap(self.scores[hoi_id], self.boxes[hoi_id], self.keys[hoi_id], gts_per_hoi)
+                self.hico_ap[hoi_id], self.hico_rec[hoi_id] = ap, rec
 
     def summarize(self, ckpt_num=""):
         """
@@ -151,6 +257,93 @@ class HICOEvaluator(object):
                 gts[hoi_id][img_id] = np.array(gts[hoi_id][img_id])
 
         return gts
+
+
+def calc_ap_known_object(scores, boxes, keys, gt_boxes, valid_image_ids):
+    """
+    Calculate AP for Known Object setting.
+
+    This mode filters the test set to only images containing the target object.
+    For example, for "ride bicycle", only evaluate on images that have bicycles.
+    This is an easier setting that focuses on interaction discrimination rather than
+    object detection + interaction recognition.
+
+    Args:
+        scores: Prediction confidence scores
+        boxes: Predicted bounding boxes (person + object)
+        keys: Image IDs for predictions
+        gt_boxes: Ground truth boxes per image
+        valid_image_ids: Set of image IDs that contain the target object
+                        (e.g., images with bicycles for bicycle-related HOIs)
+
+    Returns:
+        ap: Average Precision on the filtered test set
+        rec: Maximum Recall on the filtered test set
+    """
+    if len(keys) == 0:
+        return 0, 0
+
+    # Convert to numpy arrays if needed
+    if isinstance(boxes, list):
+        scores, boxes, keys = np.array(scores), np.array(boxes), np.array(keys)
+
+    # Filter predictions to only valid images (images containing target object)
+    valid_mask = np.array([k in valid_image_ids for k in keys])
+    scores_filtered = scores[valid_mask]
+    boxes_filtered = boxes[valid_mask]
+    keys_filtered = keys[valid_mask]
+
+    # Filter ground truth to only valid images
+    gt_boxes_filtered = {k: v for k, v in gt_boxes.items() if k in valid_image_ids}
+
+    # If no predictions or GT in valid images, return 0
+    if len(keys_filtered) == 0:
+        return 0, 0
+
+    # Calculate AP using filtered data
+    hit = []
+    idx = np.argsort(scores_filtered)[::-1]
+    npos = 0
+    used = {}
+
+    for key in gt_boxes_filtered.keys():
+        npos += gt_boxes_filtered[key].shape[0]
+        used[key] = set()
+
+    for i in range(min(len(idx), 19999)):
+        pair_id = idx[i]
+        box = boxes_filtered[pair_id, :]
+        key = keys_filtered[pair_id]
+        if key in gt_boxes_filtered:
+            maxi = 0.0
+            k = -1
+            for j in range(gt_boxes_filtered[key].shape[0]):
+                tmp = calc_hit(box, gt_boxes_filtered[key][j, :])
+                if maxi < tmp:
+                    maxi = tmp
+                    k = j
+            if k in used[key] or maxi < 0.5:
+                hit.append(0)
+            else:
+                hit.append(1)
+                used[key].add(k)
+        else:
+            hit.append(0)
+
+    if len(hit) == 0:
+        return 0, 0
+
+    bottom = np.array(range(len(hit))) + 1
+    hit = np.cumsum(hit)
+    rec = hit / npos if npos > 0 else hit / (npos + 1e-8)
+    prec = hit / bottom
+    ap = 0.0
+    for i in range(11):
+        mask = rec >= (i / 10.0)
+        if np.sum(mask) > 0:
+            ap += np.max(prec[mask]) / 11.0
+
+    return ap, np.max(rec) if len(rec) else 0
 
 
 def calc_ap(scores, boxes, keys, gt_boxes):
