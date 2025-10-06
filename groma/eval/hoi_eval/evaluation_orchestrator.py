@@ -224,8 +224,12 @@ class HOIEvaluationOrchestrator:
             'metrics': metrics
         }
 
-    def evaluate_dataset(self, dataset_type, data_root, max_images=None, batch_size=1):
-        """Evaluate an entire dataset with batch processing."""
+    def evaluate_dataset(self, dataset_type, data_root, max_images=None, batch_size=1, wandb_log=None):
+        """Evaluate an entire dataset with batch processing.
+
+        Args:
+            wandb_log: Optional wandb logging function to call with intermediate metrics
+        """
         print(f"\n{'='*80}")
         print(f"DATASET EVALUATION: {dataset_type.upper()}")
         print(f"{'='*80}")
@@ -266,6 +270,11 @@ class HOIEvaluationOrchestrator:
         all_predictions = {}
         detailed_results = {}
         processed_count = 0
+
+        # Running metrics for wandb
+        running_precision = []
+        running_recall = []
+        running_triplets = []
 
         # HOI query prompt
         hoi_query = "[grounding] Describe what each person is doing with objects individually. Focus on actions only."
@@ -401,6 +410,49 @@ class HOIEvaluationOrchestrator:
 
                     processed_count += 1
                     progress_bar.update(1)
+
+                    # Track running metrics
+                    if metrics:
+                        running_precision.append(metrics.get('precision', 0))
+                        running_recall.append(metrics.get('recall', 0))
+                    running_triplets.append(len(viz_triplets))
+
+                    # Log intermediate metrics to wandb
+                    if wandb_log and metrics:
+                        avg_precision = sum(running_precision) / len(running_precision) if running_precision else 0
+                        avg_recall = sum(running_recall) / len(running_recall) if running_recall else 0
+                        avg_triplets = sum(running_triplets) / len(running_triplets) if running_triplets else 0
+
+                        wandb_log({
+                            "progress/processed_images": processed_count,
+                            "progress/current_precision": metrics.get('precision', 0),
+                            "progress/current_recall": metrics.get('recall', 0),
+                            "progress/current_triplets": len(viz_triplets),
+                            "progress/avg_precision": avg_precision,
+                            "progress/avg_recall": avg_recall,
+                            "progress/avg_triplets": avg_triplets,
+                        })
+
+                    # Log sample visualizations periodically (every 100 images)
+                    if wandb_log and processed_count % 100 == 0:
+                        recent_vis = os.path.join(self.comparison_dir,
+                                                 f"{os.path.splitext(os.path.basename(image_path))[0]}_comparison.jpg")
+                        if os.path.exists(recent_vis):
+                            try:
+                                import wandb
+                                wandb_log({
+                                    f"progress_visualizations/sample_{processed_count}": wandb.Image(recent_vis)
+                                })
+                            except:
+                                pass  # Skip if wandb not available
+
+                # Log batch completion
+                if wandb_log:
+                    wandb_log({
+                        "progress/batch_completed": batch_idx + 1,
+                        "progress/total_batches": num_batches,
+                        "progress/batch_progress": (batch_idx + 1) / num_batches * 100
+                    })
 
                 # Memory cleanup after batch
                 torch.cuda.empty_cache()
