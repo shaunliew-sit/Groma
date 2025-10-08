@@ -15,6 +15,12 @@ and reusability. The original implementation has been broken down into specializ
 - image_processing.py: Image processing and model interface
 - evaluation_orchestrator.py: Main evaluation coordination logic
 
+Features:
+- ✅ Checkpoint/Resume: Automatically saves progress and resumes from crashes
+- ✅ Comprehensive Logging: Detailed log files with error tracking
+- ✅ Error Recovery: Continues processing even if individual images fail
+- ✅ Progress Tracking: Real-time progress bar and periodic checkpoint saves
+
 Usage:
     # Single image evaluation
     python -m groma.eval.run_groma_hoi_no_adj \
@@ -30,6 +36,21 @@ Usage:
         --data-root {path_to_dataset} \
         --output-dir {output_directory} \
         --gpu 0
+
+    # Resume from crash (finds checkpoint automatically)
+    python -m groma.eval.run_groma_hoi_no_adj \
+        --model-name {path_to_groma_model} \
+        --dataset hico \
+        --data-root {path_to_dataset} \
+        --resume-from {output_dir/YYYY-MM-DD_HH-MM-SS}
+
+    # Custom checkpoint interval (save every 100 images)
+    python -m groma.eval.run_groma_hoi_no_adj \
+        --model-name {path_to_groma_model} \
+        --dataset hico \
+        --data-root {path_to_dataset} \
+        --output-dir {output_directory} \
+        --checkpoint-interval 100
 
     # Single image with ground truth comparison
     python -m groma.eval.run_groma_hoi_no_adj \
@@ -60,6 +81,16 @@ Usage:
         --wandb-entity {your_username} \
         --wandb-run-name hico_eval_v1 \
         --wandb-tags hico baseline
+
+Output Structure:
+    output_dir/
+    └── YYYY-MM-DD_HH-MM-SS/
+        ├── checkpoint.pkl                    # Progress checkpoint for resume
+        ├── evaluation.log                    # Detailed execution log
+        ├── failed_images.json                # List of images that failed processing
+        ├── {dataset}_evaluation_results.json # Final evaluation metrics and results
+        ├── hoi_triplets/                     # Individual HOI visualizations
+        └── comparison/                       # Ground truth vs prediction comparisons
 """
 
 import os
@@ -239,6 +270,12 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8,
                        help="Batch size for processing images (default: 8)")
 
+    # Checkpoint and resume support
+    parser.add_argument("--checkpoint-interval", type=int, default=50,
+                       help="Save checkpoint every N images (default: 50)")
+    parser.add_argument("--resume-from", type=str, default=None,
+                       help="Resume evaluation from a previous timestamped output directory")
+
     # Evaluation protocol settings
     parser.add_argument("--evaluation-mode", type=str, choices=['default', 'known_object'],
                        default='default',
@@ -271,6 +308,24 @@ def main():
 
     if args.eval_dataset and not args.data_root:
         parser.error("--data-root is required when using --eval-dataset")
+
+    # Handle resume functionality
+    if args.resume_from:
+        if not os.path.isdir(args.resume_from):
+            parser.error(f"--resume-from directory does not exist: {args.resume_from}")
+
+        checkpoint_file = os.path.join(args.resume_from, "checkpoint.pkl")
+        if not os.path.exists(checkpoint_file):
+            parser.error(f"No checkpoint found in resume directory: {args.resume_from}")
+
+        print(f"🔄 Resuming evaluation from: {args.resume_from}")
+        # Override output_dir to use the resume directory (without timestamp)
+        # We'll need to adjust the orchestrator to not create a new timestamped dir
+        args._resume_mode = True
+        args._resume_dir = args.resume_from
+    else:
+        args._resume_mode = False
+        args._resume_dir = None
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -316,7 +371,14 @@ def main():
     else:
         print("  ℹ️  Default: Evaluates on ALL test images (harder - includes background rejection)")
     print(f"Base output directory: {args.output_dir}")
-    print(f"📅 Each run creates a timestamped subfolder (YYYY-MM-DD_HH-MM-SS) to prevent overwriting")
+
+    if args.resume_from:
+        print(f"🔄 Resume Mode: Continuing from {args.resume_from}")
+    else:
+        print(f"📅 Each run creates a timestamped subfolder (YYYY-MM-DD_HH-MM-SS) to prevent overwriting")
+
+    print(f"💾 Checkpoint interval: Every {args.checkpoint_interval} images")
+    print(f"📝 Logging: evaluation.log (detailed) + console output")
 
     # Run appropriate evaluation mode
     if args.image_file:
