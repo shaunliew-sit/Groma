@@ -3,8 +3,10 @@ import copy
 import torch
 import argparse
 import requests
+import json
+import re
 from io import BytesIO
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from transformers.image_transforms import center_to_corners_format
 from transformers import AutoTokenizer, AutoImageProcessor, BitsAndBytesConfig
 
@@ -23,14 +25,227 @@ def load_image(image_file):
     return image
 
 
-def draw_box(box, image, index, output_dir):
+def draw_box(box, image, index, output_dir, label=None, coords_text=None):
+    """Draw bounding box on image with optional label and coordinates"""
     w, h = image.size
     box = [box[0] * w, box[1] * h, box[2] * w, box[3] * h]
     draw = ImageDraw.Draw(image)
-    draw.rectangle(box, outline="red")
+    
+    # Draw rectangle
+    draw.rectangle(box, outline="red", width=3)
+    
+    # Try to load a font, fallback to default if not available
+    try:
+        font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", 16)
+    except:
+        font = ImageFont.load_default()
+    
+    # Draw label if provided
+    if label:
+        # Draw background for text
+        text_bbox = draw.textbbox((box[0], box[1] - 25), label, font=font)
+        draw.rectangle(text_bbox, fill="red")
+        draw.text((box[0], box[1] - 25), label, fill="white", font=font)
+    
+    # Draw coordinates if provided
+    if coords_text:
+        coords_y = box[1] - 45 if label else box[1] - 25
+        coords_bbox = draw.textbbox((box[0], coords_y), coords_text, font=font)
+        draw.rectangle(coords_bbox, fill="blue")
+        draw.text((box[0], coords_y), coords_text, fill="white", font=font)
+    
     output_file = os.path.join(output_dir, 'r{}.jpg'.format(index))
     image.save(output_file, "JPEG")
     return
+
+
+def extract_coordinates_from_response(response_text, pred_boxes, box_idx_token_ids, output_ids, input_token_len, tokenizer):
+    """Extract coordinate information and map them to objects in the response"""
+    coordinates_info = []
+    
+    # Get the actual output tokens (excluding input)
+    output_tokens = output_ids[0, input_token_len:]
+    
+    # Find all region token indices in the output
+    selected_box_inds = []
+    token_positions = []
+    
+    for pos, token_id in enumerate(output_tokens):
+        if token_id.item() in box_idx_token_ids:
+            box_idx = box_idx_token_ids.index(token_id.item())
+            if box_idx < len(pred_boxes):
+                selected_box_inds.append(box_idx)
+                token_positions.append(pos)
+    
+    # Decode the response text and find region tokens
+    decoded_tokens = tokenizer.convert_ids_to_tokens(output_tokens)
+    
+    # Extract context around each region token
+    for i, (box_idx, token_pos) in enumerate(zip(selected_box_inds, token_positions)):
+        box_coords = pred_boxes[box_idx].tolist()
+        
+        # Get surrounding context (up to 10 tokens before and after)
+        context_start = max(0, token_pos - 10)
+        context_end = min(len(decoded_tokens), token_pos + 10)
+        context_tokens = decoded_tokens[context_start:context_end]
+        context_text = tokenizer.convert_tokens_to_string(context_tokens)
+        
+        # Try to extract object description from context
+        region_token = f"<r{box_idx}>"
+        object_description = extract_object_description(response_text, region_token)
+        
+        # Debug: print the mapping for verification
+        print(f"[DEBUG] Mapping {region_token} -> '{object_description}'")
+        
+        coordinates_info.append({
+            'region_id': box_idx,
+            'region_token': region_token,
+            'coordinates': box_coords,  # [x1, y1, x2, y2] normalized
+            'token_position': token_pos,
+            'context': context_text.strip(),
+            'object_description': object_description,
+            'type': 'detected_region'
+        })
+    
+    return coordinates_info, selected_box_inds
+
+
+def debug_response_structure(response_text):
+    """Debug function to show the structure of the response for better understanding"""
+    print("\n[DEBUG] Response structure analysis:")
+    
+    # Find all <p> tags
+    p_matches = re.findall(r'<p>([^<]+)</p>', response_text)
+    if p_matches:
+        print(f"Found {len(p_matches)} <p> tags:")
+        for i, content in enumerate(p_matches):
+            print(f"  <p>{i}: '{content}'")
+    else:
+        print("No <p> tags found")
+    
+    # Find all region tokens
+    r_matches = re.findall(r'<r\d+>', response_text)
+    if r_matches:
+        print(f"Found region tokens: {r_matches}")
+    
+    print("[DEBUG] End response analysis\n")
+
+
+def extract_object_description(response_text, region_token):
+    """Extract object description from <p> tags by finding the correct <p> tag before each <roi><r#></roi> pattern"""
+    
+    # The correct pattern is: <p>description</p><roi><r#></roi>
+    # We need to find the <p> tag that comes immediately before our specific region token
+    
+    # Look for the pattern: <p>content</p><roi><our_region_token></roi>
+    escaped_token = re.escape(region_token)
+    direct_pattern = rf'<p>([^<]+)</p><roi>{escaped_token}</roi>'
+    
+    match = re.search(direct_pattern, response_text)
+    if match:
+        return match.group(1).strip()
+    
+    # Alternative pattern: sometimes there might be spaces or variations
+    # <p>content</p>\s*<roi>\s*<r#>\s*</roi>
+    flexible_pattern = rf'<p>([^<]+)</p>\s*<roi>\s*{escaped_token}\s*</roi>'
+    match = re.search(flexible_pattern, response_text)
+    if match:
+        return match.group(1).strip()
+    
+    # Another pattern: <p>content</p> followed by <r#> (without roi tags)
+    simple_pattern = rf'<p>([^<]+)</p>.*?{escaped_token}'
+    matches = list(re.finditer(simple_pattern, response_text))
+    if matches:
+        # Find the closest <p> tag before our region token
+        region_pos = response_text.find(region_token)
+        closest_match = None
+        min_distance = float('inf')
+        
+        for match in matches:
+            p_end_pos = match.end(1) + 4  # +4 for '</p>'
+            distance = region_pos - p_end_pos
+            if 0 < distance < min_distance:  # <p> tag should come before region token
+                min_distance = distance
+                closest_match = match
+        
+        if closest_match and min_distance < 50:  # Must be within reasonable distance
+            return closest_match.group(1).strip()
+    
+    # Fallback to original pattern matching if no <p> tags found
+    patterns = [
+        rf'{re.escape(region_token)}\s+is\s+(?:a|an)?\s*([^<.!?]+)',
+        rf'{re.escape(region_token)}\s+(?:shows?|depicts?)\s+(?:a|an)?\s*([^<.!?]+)',
+        rf'([^<.!?]+)\s+{re.escape(region_token)}',
+        rf'{re.escape(region_token)}\s*[,:]*\s*([^<.!?]+)',
+        # Look for text between region token and next special token
+        rf'{re.escape(region_token)}\s*[^<]*?([a-zA-Z][^<{{}}]*?)(?=<|$)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, response_text, re.IGNORECASE)
+        if match:
+            desc = match.group(1).strip()
+            # Clean up the description
+            desc = re.sub(r'^(is|shows?|depicts?)\s+', '', desc, flags=re.IGNORECASE)
+            desc = re.sub(r'^(a|an|the)\s+', '', desc, flags=re.IGNORECASE)
+            desc = re.sub(r'[{}]', '', desc)  # Remove any remaining braces
+            if len(desc) > 3:  # Only return meaningful descriptions
+                return desc[:50]  # Limit length
+    
+    return f"Region {region_token}"
+
+
+def format_coordinates(coords, original_width, original_height, coord_format="pixel"):
+    """Format coordinates in different formats"""
+    if coord_format == "pixel":
+        return {
+            'x1': int(coords[0] * original_width),
+            'y1': int(coords[1] * original_height), 
+            'x2': int(coords[2] * original_width),
+            'y2': int(coords[3] * original_height),
+            'width': int((coords[2] - coords[0]) * original_width),
+            'height': int((coords[3] - coords[1]) * original_height),
+            'center_x': int((coords[0] + coords[2]) * original_width / 2),
+            'center_y': int((coords[1] + coords[3]) * original_height / 2)
+        }
+    else:  # normalized
+        return {
+            'x1': coords[0], 'y1': coords[1],
+            'x2': coords[2], 'y2': coords[3],
+            'width': coords[2] - coords[0],
+            'height': coords[3] - coords[1],
+            'center_x': (coords[0] + coords[2]) / 2,
+            'center_y': (coords[1] + coords[3]) / 2
+        }
+
+
+def save_coordinates_json(coordinates_info, image_file, output_dir, original_width, original_height):
+    """Save coordinate information to JSON file"""
+    output_data = {
+        'image_file': os.path.basename(image_file),
+        'image_dimensions': {'width': original_width, 'height': original_height},
+        'detected_regions': []
+    }
+    
+    for coord_info in coordinates_info:
+        pixel_coords = format_coordinates(coord_info['coordinates'], original_width, original_height, 'pixel')
+        norm_coords = format_coordinates(coord_info['coordinates'], original_width, original_height, 'normalized')
+        
+        region_data = {
+            'region_id': coord_info['region_id'],
+            'region_token': coord_info['region_token'],
+            'object_description': coord_info['object_description'],
+            'coordinates_pixel': pixel_coords,
+            'coordinates_normalized': norm_coords,
+            'context': coord_info['context']
+        }
+        output_data['detected_regions'].append(region_data)
+    
+    json_file = os.path.join(output_dir, 'coordinates.json')
+    with open(json_file, 'w') as f:
+        json.dump(output_data, f, indent=2)
+    
+    return json_file
 
 
 def eval_model(model_name, quant_type, image_file, query,):
@@ -99,26 +314,135 @@ def eval_model(model_name, quant_type, image_file, query,):
     pred_boxes = center_to_corners_format(pred_boxes)
 
     box_idx_token_ids = model.box_idx_token_ids
-    selected_box_inds = [box_idx_token_ids.index(id) for id in output_ids[0] if id in box_idx_token_ids]
-    selected_box_inds = [x for x in selected_box_inds if x < len(pred_boxes)]
+    
+    # Extract coordinates and object information
+    coordinates_info, selected_box_inds = extract_coordinates_from_response(
+        "", pred_boxes, box_idx_token_ids, output_ids, input_token_len, tokenizer
+    )
 
-    output_dir = os.path.join(args.output_dir, image_file.split('.')[0].split('/')[-1])
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    for i, box in enumerate(pred_boxes[selected_box_inds, :]):
-        img_copy = copy.deepcopy(raw_image)
-        draw_box(box, img_copy, selected_box_inds[i], output_dir)
-
-    # for i, box in enumerate(pred_boxes):
-    #     img_copy = copy.deepcopy(raw_image)
-    #     draw_box(box, img_copy, i, output_dir)
-
+    # Decode the response text for better object descriptions
     n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
     if n_diff_input_output > 0:
         print(f'[Warning] {n_diff_input_output} output_ids are not the same as the input_ids')
-    outputs = tokenizer.batch_decode(output_ids[:, input_token_len:], skip_special_tokens=False)[0]
-    outputs = outputs.strip()
-    print(outputs)
+    response_text = tokenizer.batch_decode(output_ids[:, input_token_len:], skip_special_tokens=False)[0]
+    response_text = response_text.strip()
+    
+    # Debug the response structure to understand <p> tag patterns
+    debug_response_structure(response_text)
+    
+    # Re-extract coordinates with full response text for better object descriptions
+    coordinates_info, selected_box_inds = extract_coordinates_from_response(
+        response_text, pred_boxes, box_idx_token_ids, output_ids, input_token_len, tokenizer
+    )
+
+    # Create output directory
+    output_dir = os.path.join(args.output_dir, image_file.split('.')[0].split('/')[-1])
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    # Get original image dimensions
+    original_width, original_height = raw_image.size
+    
+    # Save coordinate information to JSON
+    json_file = save_coordinates_json(coordinates_info, image_file, output_dir, original_width, original_height)
+    
+    # Create annotated image with all boxes
+    annotated_image = copy.deepcopy(raw_image)
+    draw = ImageDraw.Draw(annotated_image)
+    
+    # Try to load a font
+    try:
+        font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", 16)
+    except:
+        font = ImageFont.load_default()
+    
+    # Draw all boxes on the main image
+    for coord_info in coordinates_info:
+        box = coord_info['coordinates']
+        w, h = annotated_image.size
+        pixel_box = [box[0] * w, box[1] * h, box[2] * w, box[3] * h]
+        
+        # Draw rectangle
+        draw.rectangle(pixel_box, outline="red", width=3)
+        
+        # Prepare label text - use object description as primary label
+        object_desc = coord_info['object_description']
+        if object_desc.startswith('Region <r'):
+            # If no meaningful description found, show the region token
+            label = coord_info['region_token']
+        else:
+            # Use the actual object description from <p> tags
+            label = object_desc
+        coords_text = f"({int(pixel_box[0])},{int(pixel_box[1])}) {int(pixel_box[2]-pixel_box[0])}x{int(pixel_box[3]-pixel_box[1])}"
+        
+        # Draw label background and text
+        text_y = pixel_box[1] - 45
+        if text_y < 0:
+            text_y = pixel_box[3] + 5
+            
+        label_bbox = draw.textbbox((pixel_box[0], text_y), label, font=font)
+        draw.rectangle(label_bbox, fill="red")
+        draw.text((pixel_box[0], text_y), label, fill="white", font=font)
+        
+        # Draw coordinates
+        coords_y = text_y + 20
+        coords_bbox = draw.textbbox((pixel_box[0], coords_y), coords_text, font=font)
+        draw.rectangle(coords_bbox, fill="blue")
+        draw.text((pixel_box[0], coords_y), coords_text, fill="white", font=font)
+    
+    # Save the main annotated image
+    main_output_file = os.path.join(output_dir, 'annotated_image.jpg')
+    annotated_image.save(main_output_file, "JPEG")
+    
+    # Create individual region images (existing functionality)
+    for i, coord_info in enumerate(coordinates_info):
+        box = coord_info['coordinates']
+        img_copy = copy.deepcopy(raw_image)
+        
+        # Format coordinates for display
+        pixel_coords = format_coordinates(box, original_width, original_height, 'pixel')
+        coords_text = f"({pixel_coords['x1']},{pixel_coords['y1']}) {pixel_coords['width']}x{pixel_coords['height']}"
+        
+        # Use meaningful description for individual images too
+        individual_label = coord_info['object_description'] if not coord_info['object_description'].startswith('Region <r') else coord_info['region_token']
+        
+        draw_box(
+            box, img_copy, coord_info['region_id'], output_dir,
+            label=individual_label,
+            coords_text=coords_text
+        )
+    
+    # Print response and coordinate information
+    print("=" * 60)
+    print("MODEL RESPONSE:")
+    print(response_text)
+    print("=" * 60)
+    print("DETECTED COORDINATES:")
+    
+    for coord_info in coordinates_info:
+        pixel_coords = format_coordinates(coord_info['coordinates'], original_width, original_height, 'pixel')
+        norm_coords = format_coordinates(coord_info['coordinates'], original_width, original_height, 'normalized')
+        
+        # Display object description prominently
+        object_desc = coord_info['object_description']
+        if object_desc.startswith('Region <r'):
+            print(f"\n{coord_info['region_token']}: [No description found]")
+        else:
+            print(f"\n{coord_info['region_token']}: {object_desc}")
+        
+        print(f"  Pixel coordinates: ({pixel_coords['x1']}, {pixel_coords['y1']}) to ({pixel_coords['x2']}, {pixel_coords['y2']})")
+        print(f"  Size: {pixel_coords['width']} x {pixel_coords['height']} pixels")
+        print(f"  Center: ({pixel_coords['center_x']}, {pixel_coords['center_y']})")
+        print(f"  Normalized: ({norm_coords['x1']:.3f}, {norm_coords['y1']:.3f}) to ({norm_coords['x2']:.3f}, {norm_coords['y2']:.3f})")
+        if coord_info['context']:
+            print(f"  Context: {coord_info['context'][:100]}...")
+    
+    print(f"\n=" * 60)
+    print(f"OUTPUTS SAVED TO: {output_dir}")
+    print(f"- Annotated image: {main_output_file}")
+    print(f"- Individual regions: r{{N}}.jpg files")
+    print(f"- Coordinate data: {json_file}")
+    print(f"=" * 60)
 
 
 if __name__ == "__main__":

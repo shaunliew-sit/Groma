@@ -50,6 +50,10 @@ def build_dataset(dataset_cfg, tokenizer=None, **kwargs):
         dataset = LLaVAInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
     elif dataset_type == 'groma_instruct':
         dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
+    elif dataset_type == 'hico_hoi_instruct':
+        dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
+    elif dataset_type == 'swig_hoi_instruct':
+        dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
     else:
         raise NotImplementedError
 
