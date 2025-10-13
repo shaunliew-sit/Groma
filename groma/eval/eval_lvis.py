@@ -167,6 +167,16 @@ def eval_model(args):
             }
             results.append(result)
 
+    # Save results to JSON file
+    print(f"\nSaving {len(results)} predictions to {args.result_file}")
+    with open(args.result_file, 'w') as f:
+        json.dump(results, f)
+
+    print(f"Total images processed: {len(dataset)}")
+    print(f"Invalid predictions (no boxes): {invalid}")
+
+    # Run LVIS evaluation
+    print("\nRunning LVIS evaluation...")
     lvis_eval = CustomLVISEval(args.ann_file, args.result_file, 'bbox')
     lvis_eval.run()
     lvis_eval.print_results()
@@ -177,8 +187,10 @@ if __name__ == "__main__":
     parser.add_argument("--model-name", type=str, default="checkpoints/groma-finetune/")
     parser.add_argument("--ann-file", type=str, default="lvis_ground.json")
     parser.add_argument("--img-prefix", type=str, default="datasets/coco/")
+    parser.add_argument("--result-file", type=str, default="lvis_results.json",
+                        help="Output file for prediction results")
     parser.add_argument("--box_score_thres", type=float, default=0.15)
-    parser.add_argument("--batch_size_per_gpu", required=False, default=1)
+    parser.add_argument("--batch_size_per_gpu", type=int, default=1)
     args = parser.parse_args()
 
     eval_model(args)

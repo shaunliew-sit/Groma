@@ -127,8 +127,26 @@ if [ $? -eq 0 ]; then
     echo "============================================================"
     echo "✅ Training completed successfully!"
     echo "============================================================"
+
+    # Copy preprocessor config from DINOv2 to output (needed for Stage 2)
+    echo ""
+    echo "Copying preprocessor config from DINOv2..."
+    if [ -f "$DINOV2_PATH/preprocessor_config.json" ]; then
+        cp "$DINOV2_PATH/preprocessor_config.json" "$OUTPUT_DIR/"
+        echo "✅ Copied preprocessor_config.json"
+    else
+        echo "⚠️  Warning: preprocessor_config.json not found in DINOv2"
+    fi
+
+    if [ -f "$DINOV2_PATH/config.json" ]; then
+        cp "$DINOV2_PATH/config.json" "$OUTPUT_DIR/"
+        echo "✅ Copied config.json"
+    fi
+
+    echo ""
     echo "Output:"
     echo "  Checkpoint:    $OUTPUT_DIR/pytorch_model.bin"
+    echo "  Config files:  $OUTPUT_DIR/preprocessor_config.json"
     echo "  Log file:      $OUTPUT_DIR/train.log"
     echo "  WandB run:     https://wandb.ai/$WANDB_PROJECT/runs/$RUN_NAME"
     echo "============================================================"
