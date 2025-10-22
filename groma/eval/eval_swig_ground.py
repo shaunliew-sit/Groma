@@ -1,7 +1,7 @@
 """
-HICO-DET Object Grounding Evaluation Script
+SWIG-HOI Object Grounding Evaluation Script
 
-Evaluates object grounding performance on HICO-DET dataset.
+Evaluates object grounding performance on SWIG-HOI dataset.
 Task: Given object category names, predict bounding boxes for those objects.
 
 Metrics: COCO-style AP/AR (similar to LVIS-Ground evaluation)
@@ -22,7 +22,7 @@ from pycocotools.cocoeval import COCOeval
 
 from groma.utils import disable_torch_init
 from groma.model.groma import GromaModel
-from groma.data.datasets.hico_ground import HICOGroundTest, collate_fn
+from groma.data.datasets.swig_ground import SWIGGroundTest, collate_fn
 
 
 def rescale_box(boxes, img_shape):
@@ -143,7 +143,7 @@ def create_coco_ground_truth(dataset):
 
     return {
         "info": {
-            "description": "HICO-DET Object Grounding Ground Truth",
+            "description": "SWIG-HOI Object Grounding Ground Truth",
             "version": "1.0",
             "year": 2024
         },
@@ -171,7 +171,7 @@ def eval_model(args):
     print(f"Box score threshold: {args.box_score_thres}")
 
     # Load dataset
-    dataset = HICOGroundTest(
+    dataset = SWIGGroundTest(
         ann_file=args.ann_file,
         img_prefix=args.img_prefix,
         tokenizer=tokenizer,
@@ -530,7 +530,7 @@ def eval_model(args):
 
     # Print LVIS-Ground style table
     print("\n" + "=" * 70)
-    print("HICO-DET Object Grounding Metrics (LVIS-Ground Style)")
+    print("SWIG-HOI Object Grounding Metrics (LVIS-Ground Style)")
     print("=" * 70)
     print(f"{'Metric':<12} {'Value':>8}  {'Description':<40}")
     print("-" * 70)
@@ -541,7 +541,7 @@ def eval_model(args):
     print(f"{'AR@m':<12} {metrics['ARm']*100:>7.1f}%  {'Average Recall for medium objects (32²-96²px)':<40}")
     print(f"{'AR@l':<12} {metrics['ARl']*100:>7.1f}%  {'Average Recall for large objects (>96²px)':<40}")
     print("=" * 70)
-    print("\nNote: These metrics are computed on HICO-DET dataset (80 COCO categories)")
+    print("\nNote: These metrics are computed on SWIG-HOI dataset (80 COCO categories)")
     print("      For comparison, LVIS-Ground benchmark uses LVIS dataset (1000+ categories)")
     print("      Groma paper reports on LVIS-Ground: AR=28.8%, AR@0.5=37.9%, AR@0.75=30.3%")
     print("=" * 70)
@@ -560,13 +560,13 @@ def eval_model(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="HICO-DET Object Grounding Evaluation")
+    parser = argparse.ArgumentParser(description="SWIG-HOI Object Grounding Evaluation")
     parser.add_argument("--model-name", type=str, required=True,
                         help="Path to Groma model checkpoint")
     parser.add_argument("--ann-file", type=str, required=True,
-                        help="Path to HICO grounding instruction JSON")
+                        help="Path to SWIG test annotation JSON (swig_test_1000.json)")
     parser.add_argument("--img-prefix", type=str, required=True,
-                        help="Path to HICO images directory")
+                        help="Path to SWIG images directory")
     parser.add_argument("--result-file", type=str, required=True,
                         help="Output file for prediction results")
     parser.add_argument("--box_score_thres", type=float, default=0.15,
