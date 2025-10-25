@@ -14,6 +14,14 @@ from groma.utils import disable_torch_init
 from groma.model.groma import GromaModel
 from groma.constants import DEFAULT_TOKENS
 from groma.data.conversation import conv_templates
+"""
+Example usage:
+python scripts/run_groma.py \
+      --model-name checkpoints/groma-7b-hoi-ground-refer-fine-tuned-hungarian \
+      --image-file ../data/hico_20160224_det/images/test2015/HICO_test2015_00000004.jpg \
+      --query "[grounding] Describe what each person is doing with objects individually. Focus on actions only." \
+      --output-dir output-test
+"""
 
 
 def load_image(image_file):
@@ -313,6 +321,37 @@ def eval_model(model_name, quant_type, image_file, query,):
     pred_boxes = outputs.hidden_states[0][-1]['pred_boxes'][0].cpu()
     pred_boxes = center_to_corners_format(pred_boxes)
 
+    # Debug: Show all proposed boxes from detector
+    print(f"\n{'='*60}")
+    print(f"[DEBUG] DETECTOR PROPOSED BOXES (BEFORE filtering):")
+    print(f"{'='*60}")
+    print(f"Total regions proposed: {len(pred_boxes)}")
+    for idx, box in enumerate(pred_boxes[:20]):  # Show first 20 boxes
+        x1, y1, x2, y2 = box.numpy()
+        w, h = x2 - x1, y2 - y1
+        area = w * h
+        print(f"  r{idx}: [{x1:.3f}, {y1:.3f}, {x2:.3f}, {y2:.3f}] "
+              f"size=({w:.3f} × {h:.3f}) area={area:.3f}")
+    if len(pred_boxes) > 20:
+        print(f"  ... and {len(pred_boxes) - 20} more boxes")
+    print(f"{'='*60}\n")
+
+    # SMART FILTERING: Filter giant boxes BEFORE forward pass to prevent index remapping
+    # Strategy: Remove boxes larger than 50% of image area (likely background/catch-all boxes)
+    # This ensures model doesn't see giant boxes at inference time
+    MAX_BOX_AREA_RATIO = 0.5  # Adjust this threshold based on your dataset
+
+    box_areas = (pred_boxes[:, 2] - pred_boxes[:, 0]) * (pred_boxes[:, 3] - pred_boxes[:, 1])
+    valid_box_mask = box_areas < MAX_BOX_AREA_RATIO
+
+    print(f"\n[SMART FILTER] Filtering boxes with area > {MAX_BOX_AREA_RATIO}")
+    print(f"  Before: {len(pred_boxes)} boxes")
+    print(f"  Removed giant boxes: {(~valid_box_mask).sum().item()} boxes")
+
+    # Filter BEFORE passing to model
+    pred_boxes = pred_boxes[valid_box_mask]
+    print(f"  After: {len(pred_boxes)} boxes\n")
+
     box_idx_token_ids = model.box_idx_token_ids
     
     # Extract coordinates and object information
@@ -393,7 +432,57 @@ def eval_model(model_name, quant_type, image_file, query,):
     # Save the main annotated image
     main_output_file = os.path.join(output_dir, 'annotated_image.jpg')
     annotated_image.save(main_output_file, "JPEG")
-    
+
+    # Create visualization of ALL filtered boxes (for debugging)
+    all_boxes_image = copy.deepcopy(raw_image)
+    draw_all = ImageDraw.Draw(all_boxes_image)
+
+    # Draw all filtered boxes with their indices
+    for idx, box in enumerate(pred_boxes):
+        x1, y1, x2, y2 = box.numpy()
+        pixel_box = [x1 * original_width, y1 * original_height,
+                     x2 * original_width, y2 * original_height]
+
+        # Use different colors for visual distinction
+        colors = ['red', 'blue', 'green', 'yellow', 'orange', 'purple', 'cyan', 'magenta']
+        color = colors[idx % len(colors)]
+
+        # Draw rectangle
+        draw_all.rectangle(pixel_box, outline=color, width=2)
+
+        # Draw region label
+        label = f"r{idx}"
+        area = (x2 - x1) * (y2 - y1)
+        label_with_area = f"{label} ({area:.2f})"
+
+        text_y = pixel_box[1] - 20
+        if text_y < 0:
+            text_y = pixel_box[3] + 5
+
+        label_bbox = draw_all.textbbox((pixel_box[0], text_y), label_with_area, font=font)
+        draw_all.rectangle(label_bbox, fill=color)
+        draw_all.text((pixel_box[0], text_y), label_with_area, fill="white", font=font)
+
+    all_boxes_file = os.path.join(output_dir, 'all_proposed_regions.jpg')
+    all_boxes_image.save(all_boxes_file, "JPEG")
+
+    # Create side-by-side comparison
+    comparison_width = original_width * 2
+    comparison_height = original_height
+    comparison_image = Image.new('RGB', (comparison_width, comparison_height), color='white')
+
+    # Paste all boxes on left, selected boxes on right
+    comparison_image.paste(all_boxes_image, (0, 0))
+    comparison_image.paste(annotated_image, (original_width, 0))
+
+    # Add labels
+    draw_comparison = ImageDraw.Draw(comparison_image)
+    draw_comparison.text((10, 10), "ALL PROPOSED REGIONS", fill="red", font=font)
+    draw_comparison.text((original_width + 10, 10), "MODEL SELECTION", fill="red", font=font)
+
+    comparison_file = os.path.join(output_dir, 'comparison.jpg')
+    comparison_image.save(comparison_file, "JPEG")
+
     # Create individual region images (existing functionality)
     for i, coord_info in enumerate(coordinates_info):
         box = coord_info['coordinates']
@@ -440,6 +529,8 @@ def eval_model(model_name, quant_type, image_file, query,):
     print(f"\n=" * 60)
     print(f"OUTPUTS SAVED TO: {output_dir}")
     print(f"- Annotated image: {main_output_file}")
+    print(f"- All proposed regions: {all_boxes_file}")
+    print(f"- Side-by-side comparison: {comparison_file}")
     print(f"- Individual regions: r{{N}}.jpg files")
     print(f"- Coordinate data: {json_file}")
     print(f"=" * 60)

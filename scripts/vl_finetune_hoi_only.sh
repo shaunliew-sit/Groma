@@ -123,7 +123,7 @@ CUDA_VISIBLE_DEVICES=$GPU_IDS torchrun \
     --model_max_length 2048 \
     --report_to wandb \
     --run_name $RUN_NAME \
-    --dataloader_num_workers 8 \
+    --dataloader_num_workers 2 \
     --box_score_thres 0.15 \
     2>&1 | tee $OUTPUT_DIR/train.log
 

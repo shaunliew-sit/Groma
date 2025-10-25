@@ -1,30 +1,42 @@
-# HICO-DET + SWIG-HOI Mixed Fine-tuning Configuration
-# Combined HOI grounding instruction fine-tuning on both datasets
-# Format: Matches Groma Instruct format exactly (v2 with <ground_box> tokens)
+# HICO-DET + SWIG-HOI Mixed Fine-tuning Configuration (LATEST)
+# Combined HOI grounding + referring instruction fine-tuning on both datasets
+#
+# New features:
+# - Dual-task format: Grounding (detection) + Referring (action recognition)
+# - Standardized -ing form verbs for all actions
+# - Deduplicated boxes: one unique box per entity
+# - One action per person-object pair: no redundant descriptions
 
 datasets = [
-    # HICO-DET HOI Grounding Instructions
+    # HICO-DET HOI Instructions (LATEST - Grounding + Referring)
     {
         'type': 'hico_hoi_instruct',
-        'ann_file': '/Users/shaunliew/Documents/Intent-Identification-Detection/hico_20160224_det/annotations/groma_instructions/hico_grounding_instruct_train_v2.json',
+        'ann_file': '/Users/shaunliew/Documents/Intent-Identification-Detection/hico_20160224_det/annotations/groma_instructions/latest_hico_grounding_referring_train_v2.json',
         'img_prefix': '/Users/shaunliew/Documents/Intent-Identification-Detection/hico_20160224_det/images/train2015',
         'conv_temp': 'llava'
     },
-    # SWIG-HOI Grounding Instructions
+    # SWIG-HOI Instructions (LATEST - Grounding + Referring)
     {
         'type': 'swig_hoi_instruct',
-        'ann_file': '/Users/shaunliew/Documents/Intent-Identification-Detection/swig_hoi/annotations/groma_instructions/swig_grounding_instruct_train_v2.json',
+        'ann_file': '/Users/shaunliew/Documents/Intent-Identification-Detection/swig_hoi/annotations/groma_instructions/latest_swig_grounding_referring_train_v2.json',
         'img_prefix': '/Users/shaunliew/Documents/Intent-Identification-Detection/swig_hoi/images',
         'conv_temp': 'llava'
     }
 ]
 
-# Training on combined dataset:
-# - HICO-DET: 37,633 images → ~112,899 instruction samples
-# - SWIG-HOI: 54,601 images → ~163,803 instruction samples
-# - TOTAL: 92,234 images → ~276,702 instruction samples
+# Training on combined dataset (LATEST):
+# - HICO-DET: 130,674 samples (37,633 grounding + 93,041 referring)
+# - SWIG-HOI: 102,111 samples (41,318 grounding + 60,793 referring)
+# - TOTAL: 232,785 samples (78,951 grounding + 153,834 referring)
+#
+# Improvements over previous version:
+# - No duplicate boxes in training data
+# - Actions standardized to -ing form (riding, carrying, sitting on, etc.)
+# - Separate referring task for action recognition from bounding boxes
+# - One action per unique person-object pair (more efficient training)
 #
 # Benefits:
-# - Better generalization (real photos + movie frames)
-# - More training data (2.4x larger than HICO alone)
+# - Better entity-region mapping (no more r10, r10 for different entities)
+# - Consistent action verb format across HICO and SWIG
+# - Dual-task learning improves both detection and recognition
 # - Single model works on both HICO and SWIG benchmarks

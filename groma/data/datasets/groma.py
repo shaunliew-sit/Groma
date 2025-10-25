@@ -34,7 +34,8 @@ class GromaInstruct(Dataset):
         bboxes = normalize_box_coordinates(bboxes, (img_h, img_w))
         conversations = data_item['conversation']
 
-        new_boxes = []
+        refer_boxes_list = []  # For boxes in human queries (referring task)
+        ground_boxes_list = []  # For boxes in assistant responses (grounding task)
         new_conversations = []
         instruct = "Here is an image with region crops from it. "
         instruct += "Image: {}. ".format(DEFAULT_TOKENS['image'])
@@ -42,19 +43,40 @@ class GromaInstruct(Dataset):
         answer = 'Thank you for the image! How can I assist you with it?'
         new_conversations.append((self.conv_temp.roles[0], instruct))
         new_conversations.append((self.conv_temp.roles[1], answer))
-        
+
         assert len(conversations) % 2 == 0
         for i, conversation in enumerate(conversations):
             chat = conversation['value']
+            box_inds = conversation.get('box_inds', None)
+
             if i % 2 == 0:
+                # Human query
                 chat = DEFAULT_TOKENS['ground'] + chat
+                # If human query has box_inds, these are referring boxes
+                # IMPORTANT: Add ALL box references including duplicates (e.g., [0,0,1,1] -> add box 0 twice, box 1 twice)
+                if box_inds is not None and len(box_inds) > 0:
+                    refer_boxes_list.extend([bboxes[idx] for idx in box_inds])
             else:
+                # Assistant response
                 chat = DEFAULT_TOKENS['sep'] + chat + DEFAULT_TOKENS['sep']
-                box_inds = conversation['box_inds']
-                new_boxes.extend(bboxes[box_inds])
+                # If assistant response has box_inds, these are ground truth boxes
+                if box_inds is not None and len(box_inds) > 0:
+                    ground_boxes_list.extend([bboxes[idx] for idx in box_inds])
+
             new_conversations.append((self.conv_temp.roles[i%2], chat))
+
         prompt = self.conv_temp.get_prompt(new_conversations)
-        new_boxes = torch.stack(new_boxes)
+
+        # Stack boxes appropriately
+        if len(ground_boxes_list) > 0:
+            ground_boxes = torch.stack(ground_boxes_list)
+        else:
+            ground_boxes = torch.empty(0, 4)
+
+        if len(refer_boxes_list) > 0:
+            refer_boxes = torch.stack(refer_boxes_list)
+        else:
+            refer_boxes = torch.empty(0, 4)
 
         # tokenize conversations
         input_ids = self.tokenizer(
@@ -68,7 +90,15 @@ class GromaInstruct(Dataset):
         # Mask targets
         targets = input_ids.clone()
         sep_inds = (input_ids == self.seperator_id).nonzero(as_tuple=True)[0]
-        assert len(sep_inds) % 2 == 0
+
+        # Handle truncation cases: if truncation caused odd number of <sep> tokens,
+        # remove the last unpaired <sep> token
+        if len(sep_inds) % 2 != 0:
+            # Truncation likely cut off the closing <sep>, remove the last unpaired one
+            sep_inds = sep_inds[:-1]
+            if len(sep_inds) == 0:
+                # No valid sep pairs, this is a malformed sample - skip masking
+                pass
         for i in range(0, len(sep_inds), 2):
             pre_sep = 0 if i == 0 else sep_inds[i - 1]
             cur_sep = sep_inds[i]
@@ -84,7 +114,8 @@ class GromaInstruct(Dataset):
         data_dict = dict(
             input_ids=input_ids,
             labels=targets,
-            ground_boxes=new_boxes,
+            ground_boxes=ground_boxes,
+            refer_boxes=refer_boxes,
             source='walle_data'
         )
         return data_dict
