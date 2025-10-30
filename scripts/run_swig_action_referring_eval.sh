@@ -1,41 +1,43 @@
 #!/bin/bash
 ################################################################################
-# HICO-DET Action Referring Task Evaluation Script
+# SWIG-HOI Action Referring Task Evaluation Script
 # Evaluates HOI action prediction using METEOR and CIDEr metrics
 #
 # Task: Given (person, object) bounding boxes, predict the action connecting them
 # Metrics: METEOR (semantic similarity), CIDEr (corpus consensus), BLEU, ROUGE-L
 #
+# Note: SWIG actions are in -ing form (e.g., "stapling", "stirring") vs HICO root form
+#
 # Usage:
-#   bash scripts/run_hico_action_referring_eval.sh [GPU] [MODEL] [ANN_FILE] [IMAGES_DIR] [OUTPUT_DIR]
+#   bash scripts/run_swig_action_referring_eval.sh [GPU] [MODEL] [ANN_FILE] [IMAGES_DIR] [OUTPUT_DIR]
 #
 # Examples:
 #   # Basic usage
-#   bash scripts/run_hico_action_referring_eval.sh 0
+#   bash scripts/run_swig_action_referring_eval.sh 0
 #
 #   # With debugging flags
-#   VERBOSE=1 bash scripts/run_hico_action_referring_eval.sh 0
-#   MAX_IMAGES=10 bash scripts/run_hico_action_referring_eval.sh 0
-#   VERBOSE=1 MAX_IMAGES=10 bash scripts/run_hico_action_referring_eval.sh 0
+#   VERBOSE=1 bash scripts/run_swig_action_referring_eval.sh 0
+#   MAX_IMAGES=10 bash scripts/run_swig_action_referring_eval.sh 0
+#   VERBOSE=1 MAX_IMAGES=10 bash scripts/run_swig_action_referring_eval.sh 0
 #
 #   # With W&B logging
-#   WANDB=1 bash scripts/run_hico_action_referring_eval.sh 0
-#   WANDB=1 WANDB_PROJECT=hoi-eval WANDB_RUN_NAME=hico-action-v1 \
-#       bash scripts/run_hico_action_referring_eval.sh 0
+#   WANDB=1 bash scripts/run_swig_action_referring_eval.sh 0
+#   WANDB=1 WANDB_PROJECT=hoi-eval WANDB_RUN_NAME=swig-action-v1 \
+#       bash scripts/run_swig_action_referring_eval.sh 0
 #
 # Environment Variables:
 #   VERBOSE=1         Show per-triplet results + action visualizations
 #   MAX_IMAGES=N      Limit to first N images (for quick testing)
 #   WANDB=1           Enable Weights & Biases logging
-#   WANDB_PROJECT     W&B project name (default: hico-action-referring)
+#   WANDB_PROJECT     W&B project name (default: swig-action-referring)
 #   WANDB_RUN_NAME    W&B run name (default: auto-generated)
 #
 # Output files:
-#   {output_dir}/hico_action_predictions_{timestamp}.json         # Raw predictions
-#   {output_dir}/hico_action_predictions_{timestamp}_per_triplet.json  # Detailed per-triplet (VERBOSE)
-#   {output_dir}/hico_action_predictions_{timestamp}_per_action.json   # Per-action breakdown (VERBOSE)
-#   {output_dir}/hico_action_predictions_{timestamp}_metrics.json      # METEOR/CIDEr scores
-#   {output_dir}/hico_action_evaluation_{timestamp}.log                # Full log
+#   {output_dir}/swig_action_predictions_{timestamp}.json         # Raw predictions
+#   {output_dir}/swig_action_predictions_{timestamp}_per_triplet.json  # Detailed per-triplet (VERBOSE)
+#   {output_dir}/swig_action_predictions_{timestamp}_per_action.json   # Per-action breakdown (VERBOSE)
+#   {output_dir}/swig_action_predictions_{timestamp}_metrics.json      # METEOR/CIDEr scores
+#   {output_dir}/swig_action_evaluation_{timestamp}.log                # Full log
 #   {output_dir}/visualizations_{timestamp}/*.jpg                      # Visualizations (VERBOSE)
 ################################################################################
 
@@ -44,10 +46,10 @@ set -e  # Exit on error
 # Configuration with defaults
 GPU_ID="${1:-0}"
 MODEL_PATH="${2:-checkpoints/groma-7b-finetune-hoi-v2}"
-HICO_ROOT="/Users/shaunliew/Documents/Intent-Identification-Detection/hico_20160224_det"
-BENCHMARK_ANN="${3:-groma_data/benchmarks/hico_action_referring_test_coco.json}"
-IMAGES_DIR="${4:-${HICO_ROOT}/images/test2015}"
-OUTPUT_DIR="${5:-results/hico_action_referring}"
+SWIG_ROOT="/Users/shaunliew/Documents/Intent-Identification-Detection/swig_hoi"
+BENCHMARK_ANN="${3:-groma_data/benchmarks/swig_action_referring_test_coco.json}"
+IMAGES_DIR="${4:-${SWIG_ROOT}/images_512}"
+OUTPUT_DIR="${5:-results/swig_action_referring}"
 
 # Set GPU
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
@@ -57,9 +59,9 @@ mkdir -p "$OUTPUT_DIR"
 
 # Timestamp for output files
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="$OUTPUT_DIR/hico_action_evaluation_${TIMESTAMP}.log"
-PRED_FILE="$OUTPUT_DIR/hico_action_predictions_${TIMESTAMP}.json"
-METRICS_FILE="$OUTPUT_DIR/hico_action_predictions_${TIMESTAMP}_metrics.json"
+LOG_FILE="$OUTPUT_DIR/swig_action_evaluation_${TIMESTAMP}.log"
+PRED_FILE="$OUTPUT_DIR/swig_action_predictions_${TIMESTAMP}.json"
+METRICS_FILE="$OUTPUT_DIR/swig_action_predictions_${TIMESTAMP}_metrics.json"
 
 # GPU availability check (optional, shows info but doesn't fail)
 if command -v nvidia-smi &> /dev/null; then
@@ -69,7 +71,7 @@ if command -v nvidia-smi &> /dev/null; then
 fi
 
 echo "========================================================================"
-echo "HICO-DET Action Referring Evaluation (METEOR & CIDEr)"
+echo "SWIG-HOI Action Referring Evaluation (METEOR & CIDEr)"
 echo "========================================================================"
 echo "GPU:         $GPU_ID"
 echo "Model:       $MODEL_PATH"
@@ -91,13 +93,13 @@ fi
 if [ ! -f "$BENCHMARK_ANN" ]; then
     echo "ERROR: Benchmark annotation file not found at $BENCHMARK_ANN"
     echo "Please generate it using:"
-    echo "  python3 groma/data/annotation_converters/hico_to_action_referring.py"
+    echo "  python3 groma/data/annotation_converters/swig_to_action_referring.py"
     exit 1
 fi
 
 if [ ! -d "$IMAGES_DIR" ]; then
     echo "ERROR: Images directory not found at $IMAGES_DIR"
-    echo "Please check the path to HICO test2015 images"
+    echo "Please check the path to SWIG images_512"
     exit 1
 fi
 
@@ -146,7 +148,7 @@ echo "Starting evaluation..."
 echo "========================================================================"
 echo ""
 
-python groma/eval/eval_hico_action_referring.py \
+python groma/eval/eval_swig_action_referring.py \
     --model-name "$MODEL_PATH" \
     --img-prefix "$IMAGES_DIR" \
     --ann-file "$BENCHMARK_ANN" \

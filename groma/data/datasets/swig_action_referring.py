@@ -1,12 +1,15 @@
 """
-HICO-DET Action Referring Dataset for Evaluation
+SWIG-HOI Action Referring Dataset for Evaluation
 
 Task: Given two bounding boxes (person + object), predict action + object
 Input: Person bbox + Object bbox + query "What is <roi> doing with <roi>? Answer with action and target:"
-Output: Action + object phrase (e.g., "sitting bed", "holding bottle", "riding motorcycle")
+Output: Action + object phrase (e.g., "stapling paper", "stirring pot", "talking person")
 
 Format: COCO caption format where each triplet is treated as separate "image"
 Metrics: METEOR, CIDEr (semantic similarity for action+object phrases)
+
+Note: SWIG actions are in -ing form (e.g., "stapling")
+Special: Includes person-to-person interactions (e.g., "talking person", "hugging person")
 """
 
 import os
@@ -29,15 +32,16 @@ ACTION_REFERRING_TEMPLATES = [
 ]
 
 
-class HICOActionReferringTest:
+class SWIGActionReferringTest:
     """
-    HICO-DET Action Referring evaluation dataset.
+    SWIG-HOI Action Referring evaluation dataset.
 
     Each sample represents one HOI triplet (person, object, action).
     The dataset is pre-processed into COCO caption format where:
     - Each "image" is actually a unique triplet ID
-    - Each "caption" is the ground truth action phrase
+    - Each "caption" is the ground truth "action object" phrase (e.g., "stapling paper", "talking person")
     - Metadata includes person/object bboxes and categories
+    - Includes person-to-person interactions where object is also a person
     """
 
     def __init__(
@@ -53,7 +57,7 @@ class HICOActionReferringTest:
         """
         Args:
             ann_file: Path to COCO-format action referring annotations (from prepare script)
-            img_prefix: Path to HICO images directory
+            img_prefix: Path to SWIG images directory (images_512)
             tokenizer: Tokenizer for text processing
             vis_processor: Image processor (AutoImageProcessor)
             test_mode: Always True for evaluation
@@ -76,7 +80,7 @@ class HICOActionReferringTest:
         self.vis_processor = vis_processor
 
         # Load COCO-format annotations
-        print(f"Loading HICO Action Referring annotations from: {ann_file}")
+        print(f"Loading SWIG-HOI Action Referring annotations from: {ann_file}")
         self.coco = COCO(ann_file)
 
         # Get all triplet IDs (each triplet is treated as separate "image")
@@ -194,8 +198,8 @@ class HICOActionReferringTest:
         Format:
             USER: Here is an image with region crops from it. Image: <image>. Regions: <region>.
             ASSISTANT: Thank you for the image! How can I assist you with it?
-            USER: What is <roi><refer_box></roi><refer_feat> doing with <roi><refer_box></roi><refer_feat>? Answer with action and target:
-            ASSISTANT: [model generates "action object" here, e.g., "riding motorcycle"]
+            USER: Describe only the action that <roi> <refer_box> </roi> <refer_feat> is doing to <roi> <refer_box> </roi> <refer_feat>. One action phrase:
+            ASSISTANT: [model generates action here]
 
         Returns:
             Full prompt string ready for tokenization
@@ -249,23 +253,17 @@ def collate_fn(batch):
 
     Since batch_size=1 for generation, just return the single item as-is
     but ensure tensors have batch dimension.
-
-    Args:
-        batch: List of dicts from __getitem__
-
-    Returns:
-        Dict with batched tensors
     """
-    assert len(batch) == 1, "Action referring evaluation only supports batch_size=1"
+    assert len(batch) == 1, "Action referring only supports batch_size=1"
 
     item = batch[0]
 
     return {
-        'input_ids': item['input_ids'].unsqueeze(0),  # (1, seq_len)
-        'image': item['image'].unsqueeze(0),          # (1, 3, 448, 448)
-        'triplet_id': item['triplet_id'],             # str
-        'person_bbox': item['person_bbox'],           # (4,)
-        'object_bbox': item['object_bbox'],           # (4,)
-        'gt_action': item['gt_action'],               # str
-        'img_info': item['img_info']                  # dict
+        'input_ids': item['input_ids'].unsqueeze(0),
+        'image': item['image'].unsqueeze(0),
+        'triplet_id': item['triplet_id'],
+        'person_bbox': item['person_bbox'].unsqueeze(0),
+        'object_bbox': item['object_bbox'].unsqueeze(0),
+        'gt_action': item['gt_action'],
+        'img_info': item['img_info']
     }

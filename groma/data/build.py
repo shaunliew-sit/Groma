@@ -54,6 +54,14 @@ def build_dataset(dataset_cfg, tokenizer=None, **kwargs):
         dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
     elif dataset_type == 'swig_hoi_instruct':
         dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
+    elif dataset_type == 'hico_ground':
+        dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
+    elif dataset_type == 'swig_ground':
+        dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
+    elif dataset_type == 'hico_action_referring':
+        dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
+    elif dataset_type == 'swig_action_referring':
+        dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
     else:
         raise NotImplementedError
 

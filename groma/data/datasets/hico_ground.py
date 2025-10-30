@@ -1,199 +1,158 @@
 """
-HICO-DET Object Grounding Dataset for Evaluation
+HICO-DET Grounding Dataset (Multi-Pair per Action-Object)
 
-Uses test_hico_ann.json which has clean category_id mappings for all objects.
-No need to parse text or filter actions - just use the category IDs directly!
+Dataset for training and evaluation on HICO-DET grounding task.
+Each sample represents ONE action-object combination with ALL matching pairs.
 
-Task: Referring Expression Comprehension (REC) for HICO objects
-Input: "Locate all {person} and {chair} in this image"
-Output: Bounding boxes for each requested category
+Task: Given "[grounding] Identify the following person and objects in the image: person {action} {object} and the {object}."
+Output: Multi-line format for multiple pairs:
+<p>person</p><roi><r0></roi><p>{object}</p><roi><r1></roi>
+<p>person</p><roi><r2></roi><p>{object}</p><roi><r3></roi>
+...
 """
 
 import os
 import json
-import random
 import torch
-from collections import defaultdict
+from PIL import Image
+from typing import Dict, List, Optional
 
 from groma.constants import DEFAULT_TOKENS
 from groma.data.conversation import conv_templates
 
 
-# Object grounding instruction templates (adapted from LVIS)
-GROUNDING_INSTRUCTIONS = [
-    "Locate all {} in this image.",
-    "Identify all instances of {} in the photo.",
-    "Find all instances of {} in the image.",
-    "Point out all the {} visible in this picture.",
-    "Detect and list each {} that appears in this photo.",
-    "What is the position of each {} in the image?",
-    "Where are the {} in this image?",
-    "Show me all {} in this picture."
-]
-
-
-class HICOGroundTest:
+class HICOGroundTrain:
     """
-    HICO-DET Object Grounding evaluation dataset.
-
-    Loads HICO test_hico_ann.json and extracts unique objects per image
-    for grounding evaluation (similar to LVIS-Ground benchmark).
+    HICO-DET Grounding training dataset.
+    Each sample = one action-object combination with ALL matching person-object pairs.
+    Multiple pairs in same sample are formatted as multi-line responses.
     """
-
-    # HICO uses COCO object categories (80 classes)
-    # Mapping from COCO category_id to name
-    COCO_CLASSES = {
-        1: 'person', 2: 'bicycle', 3: 'car', 4: 'motorcycle', 5: 'airplane',
-        6: 'bus', 7: 'train', 8: 'truck', 9: 'boat', 10: 'traffic light',
-        11: 'fire hydrant', 13: 'stop sign', 14: 'parking meter', 15: 'bench',
-        16: 'bird', 17: 'cat', 18: 'dog', 19: 'horse', 20: 'sheep',
-        21: 'cow', 22: 'elephant', 23: 'bear', 24: 'zebra', 25: 'giraffe',
-        27: 'backpack', 28: 'umbrella', 31: 'handbag', 32: 'tie', 33: 'suitcase',
-        34: 'frisbee', 35: 'skis', 36: 'snowboard', 37: 'sports ball', 38: 'kite',
-        39: 'baseball bat', 40: 'baseball glove', 41: 'skateboard', 42: 'surfboard',
-        43: 'tennis racket', 44: 'bottle', 46: 'wine glass', 47: 'cup', 48: 'fork',
-        49: 'knife', 50: 'spoon', 51: 'bowl', 52: 'banana', 53: 'apple',
-        54: 'sandwich', 55: 'orange', 56: 'broccoli', 57: 'carrot', 58: 'hot dog',
-        59: 'pizza', 60: 'donut', 61: 'cake', 62: 'chair', 63: 'couch',
-        64: 'potted plant', 65: 'bed', 67: 'dining table', 70: 'toilet', 72: 'tv',
-        73: 'laptop', 74: 'mouse', 75: 'remote', 76: 'keyboard', 77: 'cell phone',
-        78: 'microwave', 79: 'oven', 80: 'toaster', 81: 'sink', 82: 'refrigerator',
-        84: 'book', 85: 'clock', 86: 'vase', 87: 'scissors', 88: 'teddy bear',
-        89: 'hair drier', 90: 'toothbrush'
-    }
 
     def __init__(
         self,
-        ann_file,
-        img_prefix,
+        ann_file: str,
+        img_prefix: str,
         tokenizer,
-        test_mode=True,
-        conv_temp='llava'
+        vis_processor=None,
+        test_mode: bool = False,
+        conv_temp: str = 'llava'
     ):
         """
         Args:
-            ann_file: Path to test_hico_ann.json
+            ann_file: Path to grounding instruction JSON (hico_ground_train.json)
             img_prefix: Path to HICO images directory
             tokenizer: Tokenizer for text processing
-            test_mode: Always True for evaluation
+            vis_processor: Image processor (optional)
+            test_mode: If True, used for evaluation
             conv_temp: Conversation template name
         """
         self.img_prefix = img_prefix
         self.tokenizer = tokenizer
+        self.vis_processor = vis_processor
+        self.test_mode = test_mode
         self.conv_temp = conv_templates[conv_temp]
 
-        # Load HICO annotations
-        print(f"Loading HICO annotations from: {ann_file}")
+        # Load grounding samples (one per HOI triplet)
+        print(f"Loading HICO grounding samples from: {ann_file}")
         with open(ann_file, 'r') as f:
-            self.data = json.load(f)
-        print(f"Loaded {len(self.data)} images")
+            self.samples = json.load(f)
 
-        # Build reverse mapping: name -> category_id
-        self.name_to_cat_id = {v: k for k, v in self.COCO_CLASSES.items()}
+        print(f"Loaded {len(self.samples)} grounding samples")
 
-        # Process each image to extract unique objects and their boxes
-        self._process_annotations()
+        # Extract statistics
+        unique_images = len(set(s['original_image_id'] for s in self.samples))
+        print(f"Unique images: {unique_images}")
+        if unique_images > 0:
+            print(f"Avg triplets per image: {len(self.samples) / unique_images:.2f}")
 
-        all_cats = self._get_all_categories()
-        print(f"Total unique object categories: {len(all_cats)}")
-        print(f"Categories: {sorted(all_cats)[:20]}{'...' if len(all_cats) > 20 else ''}")
-        avg_objects = sum(len(item['categories']) for item in self.processed_data) / len(self.processed_data)
-        print(f"Average unique categories per image: {avg_objects:.2f}")
+        # Action and object distribution
+        from collections import Counter
+        actions = [s['action'] for s in self.samples]
+        objects = [s['object_category'] for s in self.samples]
+        action_counts = Counter(actions)
+        object_counts = Counter(objects)
+        print(f"Unique actions: {len(action_counts)}")
+        print(f"Unique object categories: {len(object_counts)}")
+        print(f"Top 5 actions: {action_counts.most_common(5)}")
+        print(f"Top 5 objects: {object_counts.most_common(5)}")
 
-    def _process_annotations(self):
-        """
-        Process HICO annotations to extract:
-        1. Unique object categories per image (using category_id)
-        2. Mapping from category name to ground truth boxes
-        """
-        self.processed_data = []
-
-        for item in self.data:
-            # Group boxes by category_id
-            category_boxes = defaultdict(list)
-
-            for ann in item['annotations']:
-                cat_id = ann['category_id']
-                bbox = ann['bbox']  # [x1, y1, x2, y2] format
-
-                # Convert to [x, y, w, h] format
-                x1, y1, x2, y2 = bbox
-                w = x2 - x1
-                h = y2 - y1
-                bbox_xywh = [x1, y1, w, h]
-
-                # Get category name
-                if cat_id in self.COCO_CLASSES:
-                    cat_name = self.COCO_CLASSES[cat_id]
-                    category_boxes[cat_name].append(bbox_xywh)
-
-            if len(category_boxes) == 0:
-                continue  # Skip images with no valid objects
-
-            processed_item = {
-                'file_name': item['file_name'],
-                'width': item['width'],
-                'height': item['height'],
-                'categories': list(category_boxes.keys()),
-                'category_boxes': dict(category_boxes),
-                'img_id': item['img_id']
-            }
-
-            self.processed_data.append(processed_item)
-
-        print(f"Processed {len(self.processed_data)} images with valid objects")
-
-    def _get_all_categories(self):
-        """Get set of all unique categories in dataset"""
-        all_cats = set()
-        for item in self.processed_data:
-            all_cats.update(item['categories'])
-        return all_cats
+        # Image cache for efficiency (same image used for multiple triplets)
+        self.image_cache = {}
+        self.max_cache_size = 100  # Cache up to 100 images
 
     def __len__(self):
-        return len(self.processed_data)
+        return len(self.samples)
 
     def __getitem__(self, idx):
         """
-        Get a single grounding query item.
-
-        NOTE: This returns the base item data. The evaluation script
-        will handle creating separate queries for each category.
+        Load one action-object group sample.
 
         Returns dict with:
-            - categories: List of object categories to ground
-            - category_boxes: Ground truth boxes per category
-            - img_id: Image ID
-            - img_shape: (height, width)
-            - file_name: Image filename
-            - base_item: Full processed item for building prompts
+            - input_ids: Tokenized input
+            - image: Processed image tensor
+            - boxes: List of boxes [person1_box, object1_box, person2_box, object2_box, ...]
+            - box_inds: Indices for all boxes (e.g., [0,1,2,3,...] for multiple pairs)
+            - metadata: action, object_category, hoi_triplet_id, etc.
         """
-        item = self.processed_data[idx]
+        sample = self.samples[idx]
+
+        # Load image (with caching)
+        img_path = os.path.join(self.img_prefix, sample['file_name'])
+
+        if img_path in self.image_cache:
+            image = self.image_cache[img_path]
+        else:
+            image = Image.open(img_path).convert('RGB')
+
+            # Add to cache if space available
+            if len(self.image_cache) < self.max_cache_size:
+                self.image_cache[img_path] = image
+            else:
+                # Simple cache replacement: remove first item
+                first_key = next(iter(self.image_cache))
+                del self.image_cache[first_key]
+                self.image_cache[img_path] = image
+
+        # Process image
+        if self.vis_processor is not None:
+            image_processed = self.vis_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+        else:
+            # Default processing
+            import numpy as np
+            image_resized = image.resize((448, 448), Image.BILINEAR)
+            image_np = np.array(image_resized, dtype=np.float32)
+            # Normalize
+            mean = np.array([0.485 * 255, 0.456 * 255, 0.406 * 255], dtype=np.float32)
+            std = np.array([0.229 * 255, 0.224 * 255, 0.225 * 255], dtype=np.float32)
+            image_np = (image_np - mean) / std
+            # Convert to tensor (C, H, W)
+            image_processed = torch.from_numpy(image_np).permute(2, 0, 1).contiguous()
+
+        # Build conversation from sample
+        conversation = sample['conversation']
+
+        # Tokenize conversation
+        input_ids = self._tokenize_conversation(conversation)
 
         return {
-            'categories': item['categories'],
-            'category_boxes': item['category_boxes'],
-            'img_id': item['img_id'],
-            'img_shape': (item['height'], item['width']),
-            'file_name': item['file_name'],
-            'base_item': item
+            'input_ids': input_ids,
+            'image': image_processed,
+            'boxes': torch.tensor(sample['boxes'], dtype=torch.float32),
+            'box_inds': sample['conversation'][1]['box_inds'],
+            'file_name': sample['file_name'],
+            'action_object_id': sample['action_object_id'],
+            'action': sample['action'],
+            'object_category': sample['object_category'],
+            'original_image_id': sample['original_image_id']
         }
 
-    def build_single_category_prompt(self, item, category):
-        """
-        Build a prompt for a single category query.
-
-        Args:
-            item: Processed data item
-            category: Single category name to query
-
-        Returns:
-            Tokenized prompt for this category
-        """
-        # Create conversation following LVIS pattern
+    def _tokenize_conversation(self, conversation):
+        """Tokenize conversation with special tokens."""
+        # Build conversation as list of (role, content) tuples
+        # First add image/region initialization (required by model)
         conversations = []
 
-        # Turn 1: Introduce image
+        # Add image and region tokens prefix
         instruct = "Here is an image with region crops from it. "
         instruct += "Image: {}. ".format(DEFAULT_TOKENS['image'])
         instruct += "Regions: {}.".format(DEFAULT_TOKENS['region'])
@@ -201,39 +160,159 @@ class HICOGroundTest:
         conversations.append((self.conv_temp.roles[0], instruct))
         conversations.append((self.conv_temp.roles[1], answer))
 
-        # Turn 2: Query for THIS category only
-        refexp = DEFAULT_TOKENS['boe'] + category + DEFAULT_TOKENS['eoe']
-        instruct = random.choice(GROUNDING_INSTRUCTIONS).format(refexp)
+        # Add actual conversation
+        for turn in conversation:
+            role = turn['from']
+            content = turn['value']
+
+            if role == 'human':
+                # Add grounding prefix token
+                content = DEFAULT_TOKENS['ground'] + content
+                conversations.append((self.conv_temp.roles[0], content))
+            else:
+                # Add separator tokens
+                content = DEFAULT_TOKENS['sep'] + content + DEFAULT_TOKENS['sep']
+                conversations.append((self.conv_temp.roles[1], content))
+
+        # Get prompt
+        prompt = self.conv_temp.get_prompt(conversations)
+
+        # Tokenize
+        input_ids = self.tokenizer(
+            prompt,
+            return_tensors='pt',
+            padding=False,
+            truncation=False
+        ).input_ids[0]
+
+        return input_ids
+
+
+class HICOGroundTest(HICOGroundTrain):
+    """
+    HICO-DET Grounding test dataset.
+    Inherits from HICOGroundTrain but used for evaluation.
+    """
+
+    def __init__(
+        self,
+        ann_file: str,
+        img_prefix: str,
+        tokenizer,
+        vis_processor=None,
+        conv_temp: str = 'llava'
+    ):
+        super().__init__(
+            ann_file=ann_file,
+            img_prefix=img_prefix,
+            tokenizer=tokenizer,
+            vis_processor=vis_processor,
+            test_mode=True,
+            conv_temp=conv_temp
+        )
+
+    def __getitem__(self, idx):
+        """
+        Load one action-object group sample for evaluation.
+
+        Returns same as training but with additional info for evaluation.
+        Note: For evaluation, ground truth boxes are extracted and returned separately.
+        """
+        sample = self.samples[idx]
+
+        # Load image (with caching)
+        img_path = os.path.join(self.img_prefix, sample['file_name'])
+
+        if img_path in self.image_cache:
+            image = self.image_cache[img_path]
+        else:
+            image = Image.open(img_path).convert('RGB')
+
+            # Add to cache
+            if len(self.image_cache) < self.max_cache_size:
+                self.image_cache[img_path] = image
+            else:
+                # Simple cache replacement
+                first_key = next(iter(self.image_cache))
+                del self.image_cache[first_key]
+                self.image_cache[img_path] = image
+
+        # Process image
+        if self.vis_processor is not None:
+            image_processed = self.vis_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+        else:
+            # Default processing
+            import numpy as np
+            image_resized = image.resize((448, 448), Image.BILINEAR)
+            image_np = np.array(image_resized, dtype=np.float32)
+            # Normalize
+            mean = np.array([0.485 * 255, 0.456 * 255, 0.406 * 255], dtype=np.float32)
+            std = np.array([0.229 * 255, 0.224 * 255, 0.225 * 255], dtype=np.float32)
+            image_np = (image_np - mean) / std
+            # Convert to tensor (C, H, W)
+            image_processed = torch.from_numpy(image_np).permute(2, 0, 1).contiguous()
+
+        # Build conversation (only query for evaluation)
+        query = sample['conversation'][0]['value']  # Human query
+
+        # Tokenize query as list of (role, content) tuples
+        # First add image/region initialization (required by model)
+        conversations = []
+
+        # Add image and region tokens prefix
+        instruct = "Here is an image with region crops from it. "
+        instruct += "Image: {}. ".format(DEFAULT_TOKENS['image'])
+        instruct += "Regions: {}.".format(DEFAULT_TOKENS['region'])
+        answer = 'Thank you for the image! How can I assist you with it?'
         conversations.append((self.conv_temp.roles[0], instruct))
-        conversations.append((self.conv_temp.roles[1], ''))  # Empty response for model to fill
+        conversations.append((self.conv_temp.roles[1], answer))
+
+        # Add grounding query with prefix token
+        query = DEFAULT_TOKENS['ground'] + query
+        conversations.append((self.conv_temp.roles[0], query))
+        conversations.append((self.conv_temp.roles[1], ''))
 
         prompt = self.conv_temp.get_prompt(conversations)
 
-        # Tokenize prompt
         input_ids = self.tokenizer(
             prompt,
-            return_tensors="pt",
-            padding="longest",
-            max_length=self.tokenizer.model_max_length,
-            truncation=True
-        ).input_ids
+            return_tensors='pt',
+            padding=False,
+            truncation=False
+        ).input_ids[0]
 
-        return input_ids, prompt
+        # Ground truth boxes (all pairs)
+        gt_boxes = sample['boxes']
+        num_pairs = sample['num_pairs']
+
+        return {
+            'input_ids': input_ids,
+            'image': image_processed,
+            'file_name': sample['file_name'],
+            'img_path': img_path,
+            'action_object_id': sample['action_object_id'],
+            'action': sample['action'],
+            'object_category': sample['object_category'],
+            'original_image_id': sample['original_image_id'],
+            'width': sample['width'],
+            'height': sample['height'],
+            # Ground truth
+            'gt_boxes': gt_boxes,  # All boxes for all pairs
+            'num_pairs': num_pairs,
+            'gt_response': sample['conversation'][1]['value']  # Expected multi-line response
+        }
 
 
 def collate_fn(batch):
     """
-    Custom collate function for HICO Ground dataset.
-    Enforces batch_size=1 for evaluation.
-    """
-    assert len(batch) == 1, "HICO Ground evaluation requires batch_size=1"
+    Collate function for dataloader.
 
-    item = batch[0]
-    return (
-        item['categories'],
-        item['category_boxes'],
-        item['img_id'],
-        item['img_shape'],
-        item['file_name'],
-        item['base_item']
-    )
+    For training: batches multiple triplets together
+    For evaluation: typically batch_size=1
+    """
+    # For simplicity, return batch as-is (list of dicts)
+    # Model will handle batching internally
+    if len(batch) == 1:
+        return batch[0]
+    else:
+        return batch

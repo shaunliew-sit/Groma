@@ -1,232 +1,169 @@
 """
-SWIG-HOI Object Grounding Dataset for Evaluation
+SWIG-HOI Grounding Dataset (Multi-Pair per Action-Object)
 
-Uses swig_test_1000.json which has category_id mappings for all objects.
-Loads SWIG categories from swig_v1_categories.py
+Dataset for training and evaluation on SWIG-HOI grounding task.
+Each sample represents ONE action-object combination with ALL matching pairs.
+Supports person-person interactions.
 
-Task: Referring Expression Comprehension (REC) for SWIG objects
-Input: "Locate all {person} and {camera} in this image"
-Output: Bounding boxes for each requested category
+Task: Given "[grounding] Identify the following person and objects in the image: person {action} {object} and the {object}."
+Output: Multi-line format for multiple pairs:
+<p>person</p><roi><r0></roi><p>{object}</p><roi><r1></roi>
+<p>person</p><roi><r2></roi><p>{object}</p><roi><r3></roi>
+...
+
+For person-person: "[grounding] Identify the following person and objects in the image: person talking person and the person."
+Output: <p>person</p><roi><r0></roi><p>person</p><roi><r1></roi>
 """
 
 import os
 import json
-import random
 import torch
-from collections import defaultdict
+from PIL import Image
+from typing import Dict, List, Optional
 
 from groma.constants import DEFAULT_TOKENS
 from groma.data.conversation import conv_templates
 
 
-# Object grounding instruction templates (adapted from LVIS)
-GROUNDING_INSTRUCTIONS = [
-    "Locate all {} in this image.",
-    "Identify all instances of {} in the photo.",
-    "Find all instances of {} in the image.",
-    "Point out all the {} visible in this picture.",
-    "Detect and list each {} that appears in this photo.",
-    "What is the position of each {} in the image?",
-    "Where are the {} in this image?",
-    "Show me all {} in this picture."
-]
-
-
-def load_swig_categories():
-    """Load SWIG category mapping from swig_v1_categories.py"""
-    import re
-
-    # Read the category file
-    categories_file = os.path.join(
-        os.path.dirname(__file__),
-        '../../eval/hoi_eval/swig_v1_categories.py'
-    )
-
-    with open(categories_file) as f:
-        content = f.read()
-
-    # Extract SWIG_CATEGORIES section (before SWIG_ACTIONS)
-    categories_match = re.search(
-        r'SWIG_CATEGORIES\s*=\s*\[(.*?)\]\s*SWIG_ACTIONS',
-        content,
-        re.DOTALL
-    )
-
-    if not categories_match:
-        raise ValueError("Could not find SWIG_CATEGORIES in swig_v1_categories.py")
-
-    categories_text = categories_match.group(1)
-
-    # Extract id and name pairs
-    category_pattern = r'"id":\s*(\d+),\s*"name":\s*"([^"]+)"'
-    matches = re.findall(category_pattern, categories_text)
-
-    # Create mapping
-    cat_id_to_name = {int(cid): name for cid, name in matches}
-
-    print(f"Loaded {len(cat_id_to_name)} SWIG categories")
-
-    return cat_id_to_name
-
-
-class SWIGGroundTest:
+class SWIGGroundTrain:
     """
-    SWIG-HOI Object Grounding evaluation dataset.
-
-    Loads SWIG swig_test_1000.json and extracts unique objects per image
-    for grounding evaluation (similar to LVIS-Ground benchmark).
+    SWIG-HOI Grounding training dataset.
+    Each sample = one action-object combination with ALL matching person-object pairs.
+    Multiple pairs in same sample are formatted as multi-line responses.
+    Supports person-person interactions.
     """
 
     def __init__(
         self,
-        ann_file,
-        img_prefix,
+        ann_file: str,
+        img_prefix: str,
         tokenizer,
-        test_mode=True,
-        conv_temp='llava'
+        vis_processor=None,
+        test_mode: bool = False,
+        conv_temp: str = 'llava'
     ):
         """
         Args:
-            ann_file: Path to swig_test_1000.json
+            ann_file: Path to grounding instruction JSON (swig_ground_train.json)
             img_prefix: Path to SWIG images directory
             tokenizer: Tokenizer for text processing
-            test_mode: Always True for evaluation
+            vis_processor: Image processor (optional)
+            test_mode: If True, used for evaluation
             conv_temp: Conversation template name
         """
-        self.ann_file = ann_file
         self.img_prefix = img_prefix
         self.tokenizer = tokenizer
+        self.vis_processor = vis_processor
         self.test_mode = test_mode
         self.conv_temp = conv_templates[conv_temp]
 
-        # Load SWIG category mapping (1000 object categories)
-        self.cat_id_to_name = load_swig_categories()
-        self.name_to_cat_id = {v: k for k, v in self.cat_id_to_name.items()}
+        # Load grounding samples (one per HOI triplet)
+        print(f"Loading SWIG grounding samples from: {ann_file}")
+        with open(ann_file, 'r') as f:
+            self.samples = json.load(f)
 
-        # Load and process annotations
-        self._load_annotations()
+        print(f"Loaded {len(self.samples)} grounding samples")
 
-    def _load_annotations(self):
-        """Load SWIG test annotations"""
-        print(f"Loading SWIG annotations from: {self.ann_file}")
+        # Extract statistics
+        unique_images = len(set(s['original_image_id'] for s in self.samples))
+        print(f"Unique images: {unique_images}")
+        if unique_images > 0:
+            print(f"Avg triplets per image: {len(self.samples) / unique_images:.2f}")
 
-        with open(self.ann_file, 'r') as f:
-            self.data = json.load(f)
+        # Action and object distribution
+        from collections import Counter
+        actions = [s['action'] for s in self.samples]
+        objects = [s['object_category'] for s in self.samples]
+        action_counts = Counter(actions)
+        object_counts = Counter(objects)
 
-        print(f"Loaded {len(self.data)} images")
+        # Person-person interaction stats
+        person_person_count = sum(1 for s in self.samples if s.get('is_person_person', False))
+        print(f"Person-person interactions: {person_person_count} / {len(self.samples)}")
 
-        # Process annotations
-        self._process_annotations()
+        print(f"Unique actions: {len(action_counts)}")
+        print(f"Unique object categories: {len(object_counts)}")
+        print(f"Top 5 actions: {action_counts.most_common(5)}")
+        print(f"Top 5 objects: {object_counts.most_common(5)}")
 
-    def _process_annotations(self):
-        """
-        Process SWIG annotations to extract unique objects per image.
-
-        SWIG format:
-        {
-            "file_name": "tattooing_86.jpg",
-            "img_id": 2,
-            "width": 771,
-            "height": 512,
-            "box_annotations": [
-                {
-                    "bbox": [x1, y1, x2, y2],  # xyxy format
-                    "category_id": 83,
-                    "aux_category_id": [30]
-                },
-                ...
-            ]
-        }
-        """
-        self.processed_data = []
-
-        for item in self.data:
-            # Group boxes by category_id
-            category_boxes = defaultdict(list)
-
-            for box_ann in item['box_annotations']:
-                cat_id = box_ann['category_id']
-                bbox = box_ann['bbox']  # [x1, y1, x2, y2]
-
-                # Convert bbox from xyxy to xywh format for COCO evaluation
-                x1, y1, x2, y2 = bbox
-                bbox_xywh = [x1, y1, x2 - x1, y2 - y1]
-
-                # Map category_id to name
-                if cat_id in self.cat_id_to_name:
-                    cat_name = self.cat_id_to_name[cat_id]
-                    category_boxes[cat_name].append(bbox_xywh)
-
-            # Only include images with at least one recognized category
-            if len(category_boxes) > 0:
-                self.processed_data.append({
-                    'img_id': item['img_id'],
-                    'file_name': item['file_name'],
-                    'width': item['width'],
-                    'height': item['height'],
-                    'categories': list(category_boxes.keys()),
-                    'category_boxes': dict(category_boxes)
-                })
-
-        print(f"Processed {len(self.processed_data)} images with valid objects")
-
-        # Calculate statistics
-        all_categories = set()
-        category_counts = []
-        for item in self.processed_data:
-            all_categories.update(item['categories'])
-            category_counts.append(len(item['categories']))
-
-        avg_categories = sum(category_counts) / len(category_counts) if category_counts else 0
-
-        print(f"Total unique object categories: {len(all_categories)}")
-        print(f"Categories: {sorted(list(all_categories))[:20]}...")
-        print(f"Average unique categories per image: {avg_categories:.2f}")
+        # Image cache for efficiency (same image used for multiple triplets)
+        self.image_cache = {}
+        self.max_cache_size = 100  # Cache up to 100 images
 
     def __len__(self):
-        return len(self.processed_data)
+        return len(self.samples)
 
     def __getitem__(self, idx):
         """
-        Get a single grounding query item.
-
-        NOTE: This returns the base item data. The evaluation script
-        will handle creating separate queries for each category.
+        Load one action-object group sample.
 
         Returns dict with:
-            - categories: List of object categories to ground
-            - category_boxes: Ground truth boxes per category
-            - img_id: Image ID
-            - img_shape: (height, width)
-            - file_name: Image filename
-            - base_item: Full processed item for building prompts
+            - input_ids: Tokenized input
+            - image: Processed image tensor
+            - boxes: List of boxes [person1_box, object1_box, person2_box, object2_box, ...]
+            - box_inds: Indices for all boxes (e.g., [0,1,2,3,...] for multiple pairs)
+            - metadata: action, object_category, is_person_person, etc.
         """
-        item = self.processed_data[idx]
+        sample = self.samples[idx]
+
+        # Load image (with caching)
+        img_path = os.path.join(self.img_prefix, sample['file_name'])
+
+        if img_path in self.image_cache:
+            image = self.image_cache[img_path]
+        else:
+            image = Image.open(img_path).convert('RGB')
+
+            # Add to cache if space available
+            if len(self.image_cache) < self.max_cache_size:
+                self.image_cache[img_path] = image
+            else:
+                # Simple cache replacement: remove first item
+                first_key = next(iter(self.image_cache))
+                del self.image_cache[first_key]
+                self.image_cache[img_path] = image
+
+        # Process image
+        if self.vis_processor is not None:
+            image_processed = self.vis_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+        else:
+            # Default processing
+            import numpy as np
+            image_resized = image.resize((448, 448), Image.BILINEAR)
+            image_np = np.array(image_resized, dtype=np.float32)
+            # Normalize
+            mean = np.array([0.485 * 255, 0.456 * 255, 0.406 * 255], dtype=np.float32)
+            std = np.array([0.229 * 255, 0.224 * 255, 0.225 * 255], dtype=np.float32)
+            image_np = (image_np - mean) / std
+            # Convert to tensor (C, H, W)
+            image_processed = torch.from_numpy(image_np).permute(2, 0, 1).contiguous()
+
+        # Build conversation from sample
+        conversation = sample['conversation']
+
+        # Tokenize conversation
+        input_ids = self._tokenize_conversation(conversation)
 
         return {
-            'categories': item['categories'],
-            'category_boxes': item['category_boxes'],
-            'img_id': item['img_id'],
-            'img_shape': (item['height'], item['width']),
-            'file_name': item['file_name'],
-            'base_item': item
+            'input_ids': input_ids,
+            'image': image_processed,
+            'boxes': torch.tensor(sample['boxes'], dtype=torch.float32),
+            'box_inds': sample['conversation'][1]['box_inds'],
+            'file_name': sample['file_name'],
+            'action_object_id': sample['action_object_id'],
+            'action': sample['action'],
+            'object_category': sample['object_category'],
+            'is_person_person': sample.get('is_person_person', False),
+            'original_image_id': sample['original_image_id']
         }
 
-    def build_single_category_prompt(self, item, category):
-        """
-        Build a prompt for a single category query.
-
-        Args:
-            item: Processed data item
-            category: Single category name to query
-
-        Returns:
-            Tokenized prompt for this category
-        """
-        # Create conversation following LVIS pattern
+    def _tokenize_conversation(self, conversation):
+        """Tokenize conversation with special tokens."""
+        # Build conversation as list of (role, content) tuples
+        # First add image/region initialization (required by model)
         conversations = []
 
-        # Turn 1: Introduce image
+        # Add image and region tokens prefix
         instruct = "Here is an image with region crops from it. "
         instruct += "Image: {}. ".format(DEFAULT_TOKENS['image'])
         instruct += "Regions: {}.".format(DEFAULT_TOKENS['region'])
@@ -234,39 +171,160 @@ class SWIGGroundTest:
         conversations.append((self.conv_temp.roles[0], instruct))
         conversations.append((self.conv_temp.roles[1], answer))
 
-        # Turn 2: Query for THIS category only
-        refexp = DEFAULT_TOKENS['boe'] + category + DEFAULT_TOKENS['eoe']
-        instruct = random.choice(GROUNDING_INSTRUCTIONS).format(refexp)
+        # Add actual conversation
+        for turn in conversation:
+            role = turn['from']
+            content = turn['value']
+
+            if role == 'human':
+                # Add grounding prefix token
+                content = DEFAULT_TOKENS['ground'] + content
+                conversations.append((self.conv_temp.roles[0], content))
+            else:
+                # Add separator tokens
+                content = DEFAULT_TOKENS['sep'] + content + DEFAULT_TOKENS['sep']
+                conversations.append((self.conv_temp.roles[1], content))
+
+        # Get prompt
+        prompt = self.conv_temp.get_prompt(conversations)
+
+        # Tokenize
+        input_ids = self.tokenizer(
+            prompt,
+            return_tensors='pt',
+            padding=False,
+            truncation=False
+        ).input_ids[0]
+
+        return input_ids
+
+
+class SWIGGroundTest(SWIGGroundTrain):
+    """
+    SWIG-HOI Grounding test dataset.
+    Inherits from SWIGGroundTrain but used for evaluation.
+    """
+
+    def __init__(
+        self,
+        ann_file: str,
+        img_prefix: str,
+        tokenizer,
+        vis_processor=None,
+        conv_temp: str = 'llava'
+    ):
+        super().__init__(
+            ann_file=ann_file,
+            img_prefix=img_prefix,
+            tokenizer=tokenizer,
+            vis_processor=vis_processor,
+            test_mode=True,
+            conv_temp=conv_temp
+        )
+
+    def __getitem__(self, idx):
+        """
+        Load one action-object group sample for evaluation.
+
+        Returns same as training but with additional info for evaluation.
+        Note: For evaluation, ground truth boxes are extracted and returned separately.
+        """
+        sample = self.samples[idx]
+
+        # Load image (with caching)
+        img_path = os.path.join(self.img_prefix, sample['file_name'])
+
+        if img_path in self.image_cache:
+            image = self.image_cache[img_path]
+        else:
+            image = Image.open(img_path).convert('RGB')
+
+            # Add to cache
+            if len(self.image_cache) < self.max_cache_size:
+                self.image_cache[img_path] = image
+            else:
+                # Simple cache replacement
+                first_key = next(iter(self.image_cache))
+                del self.image_cache[first_key]
+                self.image_cache[img_path] = image
+
+        # Process image
+        if self.vis_processor is not None:
+            image_processed = self.vis_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+        else:
+            # Default processing
+            import numpy as np
+            image_resized = image.resize((448, 448), Image.BILINEAR)
+            image_np = np.array(image_resized, dtype=np.float32)
+            # Normalize
+            mean = np.array([0.485 * 255, 0.456 * 255, 0.406 * 255], dtype=np.float32)
+            std = np.array([0.229 * 255, 0.224 * 255, 0.225 * 255], dtype=np.float32)
+            image_np = (image_np - mean) / std
+            # Convert to tensor (C, H, W)
+            image_processed = torch.from_numpy(image_np).permute(2, 0, 1).contiguous()
+
+        # Build conversation (only query for evaluation)
+        query = sample['conversation'][0]['value']  # Human query
+
+        # Tokenize query as list of (role, content) tuples
+        # First add image/region initialization (required by model)
+        conversations = []
+
+        # Add image and region tokens prefix
+        instruct = "Here is an image with region crops from it. "
+        instruct += "Image: {}. ".format(DEFAULT_TOKENS['image'])
+        instruct += "Regions: {}.".format(DEFAULT_TOKENS['region'])
+        answer = 'Thank you for the image! How can I assist you with it?'
         conversations.append((self.conv_temp.roles[0], instruct))
-        conversations.append((self.conv_temp.roles[1], ''))  # Empty response for model to fill
+        conversations.append((self.conv_temp.roles[1], answer))
+
+        # Add grounding query with prefix token
+        query = DEFAULT_TOKENS['ground'] + query
+        conversations.append((self.conv_temp.roles[0], query))
+        conversations.append((self.conv_temp.roles[1], ''))
 
         prompt = self.conv_temp.get_prompt(conversations)
 
-        # Tokenize prompt
         input_ids = self.tokenizer(
             prompt,
-            return_tensors="pt",
-            padding="longest",
-            max_length=self.tokenizer.model_max_length,
-            truncation=True
-        ).input_ids
+            return_tensors='pt',
+            padding=False,
+            truncation=False
+        ).input_ids[0]
 
-        return input_ids, prompt
+        # Ground truth boxes (all pairs)
+        gt_boxes = sample['boxes']
+        num_pairs = sample['num_pairs']
+
+        return {
+            'input_ids': input_ids,
+            'image': image_processed,
+            'file_name': sample['file_name'],
+            'img_path': img_path,
+            'action_object_id': sample['action_object_id'],
+            'action': sample['action'],
+            'object_category': sample['object_category'],
+            'is_person_person': sample.get('is_person_person', False),
+            'original_image_id': sample['original_image_id'],
+            'width': sample['width'],
+            'height': sample['height'],
+            # Ground truth
+            'gt_boxes': gt_boxes,  # All boxes for all pairs
+            'num_pairs': num_pairs,
+            'gt_response': sample['conversation'][1]['value']  # Expected multi-line response
+        }
 
 
 def collate_fn(batch):
     """
-    Custom collate function for SWIG Ground dataset.
-    Enforces batch_size=1 for evaluation.
-    """
-    assert len(batch) == 1, "SWIG Ground evaluation requires batch_size=1"
+    Collate function for dataloader.
 
-    item = batch[0]
-    return (
-        item['categories'],
-        item['category_boxes'],
-        item['img_id'],
-        item['img_shape'],
-        item['file_name'],
-        item['base_item']
-    )
+    For training: batches multiple triplets together
+    For evaluation: typically batch_size=1
+    """
+    # For simplicity, return batch as-is (list of dicts)
+    # Model will handle batching internally
+    if len(batch) == 1:
+        return batch[0]
+    else:
+        return batch
