@@ -1,22 +1,23 @@
 """
-HICO-DET Grounding Evaluation Script for Qwen3VL (Multi-Pair Format)
+SWIG-HOI Grounding Evaluation Script for InternVL3 (Multi-Pair Format)
 
-Evaluates Qwen3VL grounding performance on HICO-DET dataset with multi-pair support.
+Evaluates InternVL3 grounding performance on SWIG-HOI dataset with multi-pair support.
 
-Key Differences from Groma Evaluation:
-- Uses Qwen3VL model instead of Groma
-- Parses JSON output instead of region tokens
-- Different prompt format (no region tokens)
-- Direct bbox prediction in [0, 1000] format
+Key Differences from Qwen3VL Evaluation:
+- Uses InternVL3 model instead of Qwen3VL
+- Uses InternVL3 dynamic image preprocessing (multi-tile approach)
+- Parses InternVL3 output format (<ref></ref><box></box> or JSON)
+- Direct bbox prediction in [0, 1000] format (same as Qwen3VL)
 - Same metrics: AR (Average Recall) at multiple IoU thresholds
+- Supports person-person interactions
 
 Task: Given "Detect all person-{object} pairs where the person is {action} the {object}",
       predict bounding boxes for ALL person-object pairs performing that action.
 
-Output Format (from Qwen3VL):
+Output Format (from InternVL3):
 [
-  {"pair_id": 1, "person_bbox": [x1, y1, x2, y2], "object_bbox": [x1, y1, x2, y2]},
-  {"pair_id": 2, "person_bbox": [x1, y1, x2, y2], "object_bbox": [x1, y1, x2, y2]}
+  {"pair_id": 1, "person": [x1, y1, x2, y2], "{object}": [x1, y1, x2, y2]},
+  {"pair_id": 2, "person": [x1, y1, x2, y2], "{object}": [x1, y1, x2, y2]}
 ]
 
 Metrics: Pair-level Precision, Recall, F1 @ IoU thresholds (0.5 to 0.95)
@@ -32,8 +33,10 @@ from collections import defaultdict
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
+import torchvision.transforms as T
+from torchvision.transforms.functional import InterpolationMode
 
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from transformers import AutoModel, AutoTokenizer
 
 # Weights & Biases for experiment tracking
 try:
@@ -42,6 +45,97 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
+
+# ============================================================================
+# InternVL3 Image Preprocessing Functions
+# ============================================================================
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+def build_transform(input_size):
+    """Build image transform for InternVL3."""
+    transform = T.Compose([
+        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+        T.ToTensor(),
+        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+    ])
+    return transform
+
+def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+    """Find closest aspect ratio from target_ratios."""
+    best_ratio_diff = float('inf')
+    best_ratio = (1, 1)
+    area = width * height
+    for ratio in target_ratios:
+        target_aspect_ratio = ratio[0] / ratio[1]
+        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+        if ratio_diff < best_ratio_diff:
+            best_ratio_diff = ratio_diff
+            best_ratio = ratio
+        elif ratio_diff == best_ratio_diff:
+            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                best_ratio = ratio
+    return best_ratio
+
+def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
+    """
+    Dynamically preprocess image into multiple tiles.
+    This is InternVL3's approach to handling various aspect ratios.
+    """
+    orig_width, orig_height = image.size
+    aspect_ratio = orig_width / orig_height
+
+    # Calculate target ratios
+    target_ratios = set(
+        (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
+        i * j <= max_num and i * j >= min_num)
+    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+    # Find best ratio
+    target_aspect_ratio = find_closest_aspect_ratio(
+        aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+
+    # Calculate target dimensions
+    target_width = image_size * target_aspect_ratio[0]
+    target_height = image_size * target_aspect_ratio[1]
+    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+    # Resize image
+    resized_img = image.resize((target_width, target_height))
+    processed_images = []
+    for i in range(blocks):
+        box = (
+            (i % (target_width // image_size)) * image_size,
+            (i // (target_width // image_size)) * image_size,
+            ((i % (target_width // image_size)) + 1) * image_size,
+            ((i // (target_width // image_size)) + 1) * image_size
+        )
+        # Split into grid
+        split_img = resized_img.crop(box)
+        processed_images.append(split_img)
+
+    # Add thumbnail if requested
+    if use_thumbnail and len(processed_images) != 1:
+        thumbnail_img = image.resize((image_size, image_size))
+        processed_images.append(thumbnail_img)
+
+    return processed_images
+
+def load_image_internvl(image_file, input_size=448, max_num=12):
+    """Load and preprocess image for InternVL3."""
+    image = Image.open(image_file).convert('RGB')
+    transform = build_transform(input_size=input_size)
+    images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
+    pixel_values = [transform(img) for img in images]
+    pixel_values = torch.stack(pixel_values)
+    return pixel_values
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
 
 def calculate_iou(box1, box2):
     """
@@ -67,16 +161,21 @@ def calculate_iou(box1, box2):
     return inter_area / union_area if union_area > 0 else 0.0
 
 
-def parse_qwen3vl_json_response(response_text, img_shape):
+def parse_internvl3_json_response(response_text, img_shape):
     """
-    Parse Qwen3VL JSON response to extract person-object pairs.
+    Parse InternVL3 JSON response to extract person-object pairs.
+
+    InternVL3 uses [0, 1000] normalized coordinates (same as Qwen3VL).
+    Handles multiple formats:
+    - {"person": [x1,y1,x2,y2], "bench": [x1,y1,x2,y2]}
+    - {"person_bbox": [x1,y1,x2,y2], "object_bbox": [x1,y1,x2,y2]}
 
     Args:
         response_text: Generated JSON text like:
             ```json
             [
-              {"pair_id": 1, "person_bbox": [x1, y1, x2, y2], "object_bbox": [x1, y1, x2, y2]},
-              {"pair_id": 2, "person_bbox": [x1, y1, x2, y2], "object_bbox": [x1, y1, x2, y2]}
+              {"person": [x1, y1, x2, y2], "bench": [x1, y1, x2, y2]},
+              {"person": [x1, y1, x2, y2], "bench": [x1, y1, x2, y2]}
             ]
             ```
         img_shape: Tuple of (height, width)
@@ -124,26 +223,37 @@ def parse_qwen3vl_json_response(response_text, img_shape):
         else:
             return pairs
 
-    # Convert Qwen3VL format [0, 1000] to pixel coordinates
+    # Convert InternVL3 format [0, 1000] to pixel coordinates
     for det in detections:
-        if "person_bbox" in det and "object_bbox" in det:
-            person_bbox_qwen = det["person_bbox"]
-            object_bbox_qwen = det["object_bbox"]
+        # Find person and object keys (object key may vary)
+        person_key = None
+        object_key = None
 
-            if len(person_bbox_qwen) == 4 and len(object_bbox_qwen) == 4:
+        for key in det.keys():
+            if key.lower() in ['person', 'person_bbox']:
+                person_key = key
+            elif key.lower() not in ['pair_id', 'person', 'person_bbox']:
+                # Assume any other key is the object category
+                object_key = key
+
+        if person_key and object_key:
+            person_bbox_internvl = det[person_key]
+            object_bbox_internvl = det[object_key]
+
+            if len(person_bbox_internvl) == 4 and len(object_bbox_internvl) == 4:
                 # Convert from [0, 1000] to pixel coordinates
                 person_box = [
-                    (person_bbox_qwen[0] / 1000.0) * w,
-                    (person_bbox_qwen[1] / 1000.0) * h,
-                    (person_bbox_qwen[2] / 1000.0) * w,
-                    (person_bbox_qwen[3] / 1000.0) * h
+                    (person_bbox_internvl[0] / 1000.0) * w,
+                    (person_bbox_internvl[1] / 1000.0) * h,
+                    (person_bbox_internvl[2] / 1000.0) * w,
+                    (person_bbox_internvl[3] / 1000.0) * h
                 ]
 
                 object_box = [
-                    (object_bbox_qwen[0] / 1000.0) * w,
-                    (object_bbox_qwen[1] / 1000.0) * h,
-                    (object_bbox_qwen[2] / 1000.0) * w,
-                    (object_bbox_qwen[3] / 1000.0) * h
+                    (object_bbox_internvl[0] / 1000.0) * w,
+                    (object_bbox_internvl[1] / 1000.0) * h,
+                    (object_bbox_internvl[2] / 1000.0) * w,
+                    (object_bbox_internvl[3] / 1000.0) * h
                 ]
 
                 pairs.append({
@@ -156,22 +266,21 @@ def parse_qwen3vl_json_response(response_text, img_shape):
 
 
 def get_box_area(box):
-    """Calculate area of bounding box [x1, y1, x2, y2]"""
+    """Calculate area of bounding box [x1, y1, x2, y2]."""
     return (box[2] - box[0]) * (box[3] - box[1])
 
 
-def categorize_pair_by_size(gt_pair, area_small=1024, area_medium=9216):
+def get_size_category(box):
     """
-    Categorize a ground truth pair by object size.
-    Uses the object box area for categorization (COCO standard).
-
-    Returns: 'small', 'medium', or 'large'
+    Categorize box by size following COCO standard.
+    - small: area < 32^2 (1024)
+    - medium: 32^2 <= area <= 96^2 (1024-9216)
+    - large: area > 96^2 (9216)
     """
-    object_area = get_box_area(gt_pair['object_box'])
-
-    if object_area < area_small:
+    area = get_box_area(box)
+    if area < 1024:
         return 'small'
-    elif object_area < area_medium:
+    elif area <= 9216:
         return 'medium'
     else:
         return 'large'
@@ -250,8 +359,8 @@ def match_pairs_greedy(pred_pairs, gt_pairs, iou_threshold=0.5):
     return matches, unmatched_preds, unmatched_gts
 
 
-def visualize_qwen3vl_grounding(image_path, pred_pairs, gt_pairs, matches,
-                                 action, object_category, iou_threshold=0.5):
+def visualize_internvl3_grounding(image_path, pred_pairs, gt_pairs, matches,
+                                  action, object_category, iou_threshold=0.5):
     """
     Create visualization comparing predicted pairs vs ground truth pairs.
 
@@ -417,111 +526,71 @@ def visualize_qwen3vl_grounding(image_path, pred_pairs, gt_pairs, matches,
     return final_img
 
 
-def build_qwen3vl_prompt(action, object_category):
+def build_internvl3_grounding_prompt(action, object_category):
     """
-    Build Qwen3VL grounding prompt for person-object pair detection.
+    Build prompt for InternVL3 grounding task.
 
-    Args:
-        action: Action verb (e.g., "riding", "sitting on")
-        object_category: Object category (e.g., "bicycle", "bench")
-
-    Returns:
-        List of message dicts for Qwen3VL
+    Follows the exact format from test_internvl_grounding.sh with <ref> tags.
+    Format: <ref>person {action} {object}</ref> and <ref>{object}</ref>
+    Example: <ref>person sitting on bench</ref> and <ref>bench</ref>
     """
+    # Match test_internvl_grounding.sh format exactly for single pair,
+    # but clarify it should return array if multiple pairs exist
     prompt_text = (
-        f"Task: Detect all person-{object_category} pairs where the person is {action} the {object_category}.\n\n"
-        f"Instructions:\n"
-        f"1. Identify ALL persons performing the action '{action}' with a {object_category}\n"
-        f"2. For each person, identify the specific {object_category} they are interacting with\n"
-        f"3. Return bounding boxes in [x1, y1, x2, y2] format\n\n"
-        f"Output Format (JSON only, no other text):\n"
-        f"[\n"
-        f'  {{"pair_id": 1, "person_bbox": [x1, y1, x2, y2], "object_bbox": [x1, y1, x2, y2]}},\n'
-        f'  {{"pair_id": 2, "person_bbox": [x1, y1, x2, y2], "object_bbox": [x1, y1, x2, y2]}}\n'
-        f"]\n\n"
-        f"Important:\n"
-        f"- If NO pairs found, return: []\n"
-        f"- Output ONLY the JSON array (no markdown, no explanations)\n"
-        f"- Ensure coordinates are integers in [x1, y1, x2, y2] format"
+        f"<image>\n"
+        f"Identify the following person and objects in the image: "
+        f"<ref>person {action} {object_category}</ref> and <ref>{object_category}</ref>. "
+        f'Return JSON format: {{"person": [x1, y1, x2, y2], "{object_category}": [x1, y1, x2, y2]}}. '
+        f"If multiple pairs exist, return array: "
+        f'[{{"person": [x1, y1, x2, y2], "{object_category}": [x1, y1, x2, y2]}}, '
+        f'{{"person": [x1, y1, x2, y2], "{object_category}": [x1, y1, x2, y2]}}].'
     )
-
-    return [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": "image_placeholder"},
-                {"type": "text", "text": prompt_text}
-            ]
-        }
-    ]
+    return prompt_text
 
 
-def run_qwen3vl_inference(model, processor, image_path, action, object_category):
+def run_internvl3_inference(model, tokenizer, image_path, action, object_category,
+                            max_num=12, device=None):
     """
-    Run Qwen3VL inference for grounding task.
+    Run InternVL3 inference for grounding task.
 
     Args:
-        model: Qwen3VL model
-        processor: Qwen3VL processor
+        model: InternVL3 model
+        tokenizer: InternVL3 tokenizer
         image_path: Path to image file
         action: Action verb
         object_category: Object category name
+        max_num: Maximum number of image tiles
+        device: Device for computation (unused, kept for API compatibility)
 
     Returns:
-        output_text: Generated response text
-        image: PIL Image object
+        (output_text, image): Generated text and PIL Image
     """
-    # Load image
+    # Load and preprocess image
     image = Image.open(image_path).convert('RGB')
+    pixel_values = load_image_internvl(image_path, max_num=max_num)
 
-    # Build prompt
-    messages = build_qwen3vl_prompt(action, object_category)
+    # Move to device - use .cuda() like test script
+    pixel_values = pixel_values.to(torch.bfloat16).cuda()
 
-    # Replace placeholder with actual image
-    for msg in messages:
-        for content in msg["content"]:
-            if content.get("type") == "image":
-                content["image"] = image
+    # Build prompt - includes <image> tag in the prompt text
+    prompt_text = build_internvl3_grounding_prompt(action, object_category)
 
-    # Prepare inputs
-    inputs = processor.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt"
+    # Generate response
+    generation_config = dict(
+        max_new_tokens=512,  # Support multiple pairs
+        do_sample=False      # Deterministic
     )
-    inputs = inputs.to(model.device)
 
-    # Generate
-    with torch.inference_mode():
-        generated_ids = model.generate(
-            **inputs,
-            max_new_tokens=512,  # Allow for multiple pairs
-            do_sample=False,
-            temperature=None,
-        )
+    response = model.chat(tokenizer, pixel_values, prompt_text, generation_config)
 
-    # Decode
-    generated_ids_trimmed = [
-        out_ids[len(in_ids):]
-        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    ]
-
-    output_text = processor.batch_decode(
-        generated_ids_trimmed,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False
-    )[0]
-
-    return output_text, image
+    return response, image
 
 
 def eval_model(args):
     """Main evaluation function"""
 
     print("=" * 80)
-    print("HICO-DET Grounding Evaluation (Qwen3VL)")
+    print("SWIG-HOI Grounding Evaluation (InternVL3)")
     print("=" * 80)
     print(f"Model:       {args.model_name}")
     print(f"Device:      {args.device}")
@@ -536,13 +605,11 @@ def eval_model(args):
     # Get timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Load Qwen3VL model
-    print(f"Loading Qwen3VL model: {args.model_name}")
+    # Load InternVL3 model
+    print(f"Loading InternVL3 model: {args.model_name}")
     print(f"Target device: {args.device}")
 
     # Handle device mapping
-    # When CUDA_VISIBLE_DEVICES is set, we need to use the local device index
-    # e.g., if CUDA_VISIBLE_DEVICES=1, then cuda:0 refers to physical GPU 1
     if args.device == "auto":
         device_map = "auto"
     elif args.device.startswith("cuda"):
@@ -553,7 +620,6 @@ def eval_model(args):
             device_idx = "0"
 
         # Check if CUDA_VISIBLE_DEVICES is set
-        import os
         cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
 
         if cuda_visible is not None:
@@ -566,14 +632,24 @@ def eval_model(args):
     else:
         device_map = {"": args.device}
 
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
+    model = AutoModel.from_pretrained(
         args.model_name,
         torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        use_flash_attn=True,
+        trust_remote_code=True,
         device_map=device_map
-    )
-    processor = AutoProcessor.from_pretrained(args.model_name)
+    ).eval()
 
-    print(f"✓ Model loaded successfully on device: {model.device}\n")
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name,
+        trust_remote_code=True,
+        use_fast=False
+    )
+
+    # Get actual device
+    device = next(model.parameters()).device
+    print(f"✓ Model loaded successfully on device: {device}\n")
 
     # Initialize Weights & Biases
     use_wandb = WANDB_AVAILABLE and args.wandb
@@ -588,16 +664,16 @@ def eval_model(args):
             # Initialize run
             wandb.init(
                 project=args.wandb_project,
-                name=args.wandb_run_name or f"hico_ground_qwen3vl_{timestamp}",
+                name=args.wandb_run_name or f"swig_ground_internvl3_{timestamp}",
                 config={
                     "model": args.model_name,
                     "device": args.device,
-                    "dataset": "HICO-DET-Ground",
+                    "dataset": "SWIG-HOI-Ground",
                     "task": "multi_pair_grounding",
                     "max_images": args.max_images,
                     "timestamp": timestamp,
                 },
-                tags=["hico", "grounding", "qwen3vl", "multi-pair"]
+                tags=["swig", "grounding", "internvl3", "multi-pair", "person-person"]
             )
             print(f"✓ Weights & Biases initialized successfully!")
             print(f"  Run URL: {wandb.run.url}")
@@ -628,23 +704,20 @@ def eval_model(args):
     # Evaluation metrics at different IoU thresholds
     iou_thresholds_ar = [round(0.5 + 0.05 * i, 2) for i in range(10)]  # [0.5, 0.55, ..., 0.95]
 
-    # COCO area thresholds for small/medium/large objects
-    AREA_SMALL = 32 ** 2    # < 1024 pixels²
-    AREA_MEDIUM = 96 ** 2   # < 9216 pixels²
-
     results_per_threshold = {
         iou_thr: {
             'tp': 0,  # True positives (matched pairs)
             'fp': 0,  # False positives (unmatched predictions)
             'fn': 0,  # False negatives (unmatched GT pairs)
-            'tp_small': 0,
-            'fn_small': 0,
-            'tp_medium': 0,
-            'fn_medium': 0,
-            'tp_large': 0,
-            'fn_large': 0,
         }
         for iou_thr in iou_thresholds_ar
+    }
+
+    # Size-based results (COCO standard: small < 32^2, medium 32^2-96^2, large > 96^2)
+    results_per_size = {
+        'small': {iou_thr: {'tp': 0, 'fp': 0, 'fn': 0} for iou_thr in iou_thresholds_ar},
+        'medium': {iou_thr: {'tp': 0, 'fp': 0, 'fn': 0} for iou_thr in iou_thresholds_ar},
+        'large': {iou_thr: {'tp': 0, 'fp': 0, 'fn': 0} for iou_thr in iou_thresholds_ar}
     }
 
     # Per-sample results
@@ -672,59 +745,61 @@ def eval_model(args):
         file_name = sample['file_name']
         action = sample['action']
         object_category = sample['object_category']
+        action_object_id = sample.get('action_object_id', f"{action}_{object_category}")
+
         img_path = os.path.join(args.img_prefix, file_name)
-        img_shape = (sample['height'], sample['width'])
+        if not os.path.exists(img_path):
+            print(f"Warning: Image not found: {img_path}")
+            continue
 
-        # Build GT pairs from sample boxes
-        # Each sample has 'boxes' which is a list of boxes: [[x1,y1,x2,y2], [x1,y1,x2,y2], ...]
-        # Boxes are grouped in pairs: [person_box, object_box, person_box, object_box, ...]
-        gt_boxes_list = sample['boxes']
+        # Get image shape
+        with Image.open(img_path) as img:
+            img_shape = (img.height, img.width)
+
+        # Build GT pairs from conversation
+        # box_inds are in the 'gpt' message and contain [person1, object1, person2, object2, ...]
+        boxes = sample['boxes']
         gt_pairs = []
-
-        # Verify we have an even number of boxes (pairs)
-        if len(gt_boxes_list) % 2 != 0:
-            print(f"WARNING: Sample {file_name} has odd number of boxes ({len(gt_boxes_list)})")
-
-        for i in range(0, len(gt_boxes_list), 2):
-            if i + 1 < len(gt_boxes_list):
-                person_box = gt_boxes_list[i]
-                object_box = gt_boxes_list[i + 1]
-
-                # Verify boxes are in correct format [x1, y1, x2, y2]
-                if not (isinstance(person_box, list) and len(person_box) == 4):
-                    print(f"WARNING: Invalid person box format at {file_name}, pair {i//2}: {person_box}")
-                    continue
-                if not (isinstance(object_box, list) and len(object_box) == 4):
-                    print(f"WARNING: Invalid object box format at {file_name}, pair {i//2}: {object_box}")
-                    continue
-
-                gt_pairs.append({
-                    'person_box': person_box,
-                    'object_box': object_box
-                })
+        for conv in sample['conversation']:
+            if conv['from'] == 'gpt' and conv.get('box_inds'):
+                box_inds = conv['box_inds']
+                # Pairs are: [person1, object1, person2, object2, ...]
+                for i in range(0, len(box_inds), 2):
+                    if i + 1 < len(box_inds):
+                        person_idx = box_inds[i]
+                        object_idx = box_inds[i + 1]
+                        if person_idx < len(boxes) and object_idx < len(boxes):
+                            gt_pairs.append({
+                                'person_box': boxes[person_idx],
+                                'object_box': boxes[object_idx]
+                            })
 
         if show_verbose:
             print(f"\n[Sample {idx+1}/{len(dataset_samples)}] {file_name}")
             print(f"  Action: {action}, Object: {object_category}")
-            print(f"  GT boxes loaded: {len(gt_boxes_list)}, GT pairs: {len(gt_pairs)}")
+            print(f"  GT pairs: {len(gt_pairs)}")
 
-        # Build prompt for logging
-        prompt_messages = build_qwen3vl_prompt(action, object_category)
-        prompt_text = prompt_messages[0]['content'][1]['text']  # Extract the text part
+        # Build and log prompt (for debugging)
+        prompt_text = build_internvl3_grounding_prompt(action, object_category)
 
-        # Run Qwen3VL inference
-        output_text, image = run_qwen3vl_inference(
-            model, processor, img_path, action, object_category
-        )
+        # Run inference
+        try:
+            output_text, image = run_internvl3_inference(
+                model, tokenizer, img_path, action, object_category,
+                max_num=12, device=device
+            )
+
+            # Parse predictions
+            pred_pairs = parse_internvl3_json_response(output_text, img_shape)
+
+        except Exception as e:
+            print(f"\nError processing {file_name}: {e}")
+            output_text = ""
+            pred_pairs = []
+            prompt_text = ""
 
         if show_verbose:
-            print(f"  Prompt: {prompt_text[:100]}...")
             print(f"  Response: {output_text[:150]}...")
-
-        # Parse predicted pairs
-        pred_pairs = parse_qwen3vl_json_response(output_text, img_shape)
-
-        if show_verbose:
             print(f"  Predicted pairs: {len(pred_pairs)}")
 
         # Update action stats
@@ -732,41 +807,67 @@ def eval_model(args):
         action_stats[action]['total_gt_pairs'] += len(gt_pairs)
         action_stats[action]['total_pred_pairs'] += len(pred_pairs)
 
-        # Match predictions to GT at different IoU thresholds
-        sample_result = {
-            'file_name': file_name,
-            'action': action,
-            'object': object_category,
-            'action_object_id': sample.get('action_object_id', f"{action}_{object_category}"),
-            'num_gt_pairs': len(gt_pairs),
-            'num_pred_pairs': len(pred_pairs),
-            'prompt': prompt_text,
-            'generated_text': output_text[:200],
-            'matches_per_threshold': {}
-        }
-
+        # Match at all IoU thresholds
+        matches_per_threshold = {}
         for iou_thr in iou_thresholds_ar:
             matches, unmatched_preds, unmatched_gts = match_pairs_greedy(
                 pred_pairs, gt_pairs, iou_threshold=iou_thr
             )
-
-            # Update overall metrics
             results_per_threshold[iou_thr]['tp'] += len(matches)
             results_per_threshold[iou_thr]['fp'] += len(unmatched_preds)
             results_per_threshold[iou_thr]['fn'] += len(unmatched_gts)
 
-            # Update size-specific metrics
-            matched_gt_indices = {m[1] for m in matches}
-            for gt_idx, gt_pair in enumerate(gt_pairs):
-                size_category = categorize_pair_by_size(gt_pair, AREA_SMALL, AREA_MEDIUM)
-                if gt_idx in matched_gt_indices:
-                    # This GT was matched (True Positive for this size category)
-                    results_per_threshold[iou_thr][f'tp_{size_category}'] += 1
-                else:
-                    # This GT was not matched (False Negative for this size category)
-                    results_per_threshold[iou_thr][f'fn_{size_category}'] += 1
+            # Track size-based metrics using average size of person and object boxes
+            for match_idx, gt_idx, _, _ in matches:
+                gt_pair = gt_pairs[gt_idx]
+                # Use average area of person and object boxes to determine size
+                person_area = get_box_area(gt_pair['person_box'])
+                object_area = get_box_area(gt_pair['object_box'])
+                avg_area = (person_area + object_area) / 2.0
 
-            sample_result['matches_per_threshold'][iou_thr] = {
+                # Determine size category based on average area
+                if avg_area < 1024:
+                    size_cat = 'small'
+                elif avg_area <= 9216:
+                    size_cat = 'medium'
+                else:
+                    size_cat = 'large'
+
+                results_per_size[size_cat][iou_thr]['tp'] += 1
+
+            # Track unmatched predictions by size
+            for pred_idx in unmatched_preds:
+                pred_pair = pred_pairs[pred_idx]
+                person_area = get_box_area(pred_pair['person_box'])
+                object_area = get_box_area(pred_pair['object_box'])
+                avg_area = (person_area + object_area) / 2.0
+
+                if avg_area < 1024:
+                    size_cat = 'small'
+                elif avg_area <= 9216:
+                    size_cat = 'medium'
+                else:
+                    size_cat = 'large'
+
+                results_per_size[size_cat][iou_thr]['fp'] += 1
+
+            # Track unmatched GT by size
+            for gt_idx in unmatched_gts:
+                gt_pair = gt_pairs[gt_idx]
+                person_area = get_box_area(gt_pair['person_box'])
+                object_area = get_box_area(gt_pair['object_box'])
+                avg_area = (person_area + object_area) / 2.0
+
+                if avg_area < 1024:
+                    size_cat = 'small'
+                elif avg_area <= 9216:
+                    size_cat = 'medium'
+                else:
+                    size_cat = 'large'
+
+                results_per_size[size_cat][iou_thr]['fn'] += 1
+
+            matches_per_threshold[f'iou_{iou_thr:.2f}'] = {
                 'matched': len(matches),
                 'unmatched_preds': len(unmatched_preds),
                 'unmatched_gts': len(unmatched_gts)
@@ -775,95 +876,57 @@ def eval_model(args):
             if iou_thr == 0.5:
                 action_stats[action]['matched_pairs_05'] += len(matches)
 
-                if show_verbose:
-                    print(f"  Matched @ IoU=0.5: {len(matches)}/{len(gt_pairs)}")
+        if show_verbose:
+            matched_05 = matches_per_threshold['iou_0.50']['matched']
+            print(f"  Matched @ IoU=0.5: {matched_05}/{len(gt_pairs)}")
 
-        # Generate visualization for IoU=0.5 (moved outside IoU loop to ensure it runs once per sample)
-        if viz_dir is not None:
-            # Get matches at IoU=0.5 for visualization
-            matches_05 = sample_result['matches_per_threshold'][0.5]
-            matches_05_list, _, _ = match_pairs_greedy(pred_pairs, gt_pairs, iou_threshold=0.5)
+        # Store result
+        per_sample_results.append({
+            'file_name': file_name,
+            'action': action,
+            'object': object_category,
+            'action_object_id': action_object_id,
+            'num_gt_pairs': len(gt_pairs),
+            'num_pred_pairs': len(pred_pairs),
+            'prompt': prompt_text,  # Log the prompt for debugging
+            'generated_text': output_text[:200],
+            'matches_per_threshold': matches_per_threshold
+        })
 
+        # Visualize - save all visualizations if viz_dir is set
+        if viz_dir:
+            viz_path = os.path.join(viz_dir, f"{idx:04d}_{action}_{object_category}.jpg")
             try:
-                viz_img = visualize_qwen3vl_grounding(
+                # Get matches at IoU=0.5 for visualization
+                matches_05_list, _, _ = match_pairs_greedy(pred_pairs, gt_pairs, iou_threshold=0.5)
+                viz_img = visualize_internvl3_grounding(
                     img_path, pred_pairs, gt_pairs, matches_05_list,
                     action, object_category, iou_threshold=0.5
                 )
-
-                # Save visualization with unique filename including action and object
-                # This prevents overwriting when same image has multiple action-object pairs
-                base_name = os.path.splitext(file_name)[0]
-                # Sanitize action and object names for filename
-                action_safe = action.replace(' ', '_').replace('/', '_')
-                object_safe = object_category.replace(' ', '_').replace('/', '_')
-                viz_filename = f"{base_name}_{action_safe}_{object_safe}_viz.jpg"
-                viz_path = os.path.join(viz_dir, viz_filename)
                 viz_img.save(viz_path, quality=90)
-
-                if show_verbose:
-                    print(f"  Visualization saved: {viz_filename}")
-
-                # Log to WandB if enabled
-                if use_wandb:
-                    wandb.log({
-                        f"visualization/{idx:04d}_{action_safe}_{object_safe}": wandb.Image(
-                            viz_img,
-                            caption=f"{file_name} | {action} {object_category} | Pred:{len(pred_pairs)} GT:{len(gt_pairs)} Matched:{len(matches_05_list)}"
-                        )
-                    })
             except Exception as e:
                 if show_verbose:
                     print(f"  Warning: Visualization failed: {e}")
 
-        per_sample_results.append(sample_result)
-
-        # Log per-sample metrics to WandB
-        if use_wandb:
-            matches_05 = sample_result['matches_per_threshold'][0.5]['matched']
-            recall_05 = matches_05 / len(gt_pairs) if len(gt_pairs) > 0 else 0.0
+        # Log to WandB
+        if use_wandb and idx % 10 == 0:
             wandb.log({
-                'sample_idx': idx,
-                'recall@0.5': recall_05,
-                'num_pred_pairs': len(pred_pairs),
-                'num_gt_pairs': len(gt_pairs),
-                'num_matched@0.5': matches_05,
+                'samples_processed': idx + 1,
+                'current_sample': file_name
             })
 
     # Compute Average Recall (AR) metrics
     print("\n" + "=" * 80)
-    print("HICO-DET Grounding Evaluation Results (Qwen3VL)")
+    print("SWIG-HOI Grounding Evaluation Results (InternVL3)")
     print("=" * 80)
 
-    # Compute recalls at all IoU thresholds
+    # Compute recalls at all IoU thresholds (overall)
     recalls = []
-    recalls_small = []
-    recalls_medium = []
-    recalls_large = []
-
     for iou_thr in iou_thresholds_ar:
-        # Overall recall
         tp = results_per_threshold[iou_thr]['tp']
         fn = results_per_threshold[iou_thr]['fn']
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         recalls.append(recall)
-
-        # Small object recall
-        tp_small = results_per_threshold[iou_thr]['tp_small']
-        fn_small = results_per_threshold[iou_thr]['fn_small']
-        recall_small = tp_small / (tp_small + fn_small) if (tp_small + fn_small) > 0 else 0.0
-        recalls_small.append(recall_small)
-
-        # Medium object recall
-        tp_medium = results_per_threshold[iou_thr]['tp_medium']
-        fn_medium = results_per_threshold[iou_thr]['fn_medium']
-        recall_medium = tp_medium / (tp_medium + fn_medium) if (tp_medium + fn_medium) > 0 else 0.0
-        recalls_medium.append(recall_medium)
-
-        # Large object recall
-        tp_large = results_per_threshold[iou_thr]['tp_large']
-        fn_large = results_per_threshold[iou_thr]['fn_large']
-        recall_large = tp_large / (tp_large + fn_large) if (tp_large + fn_large) > 0 else 0.0
-        recalls_large.append(recall_large)
 
     # Compute AR (Average Recall across IoU 0.5:0.95)
     ar = float(np.mean(recalls)) if recalls else 0.0
@@ -871,20 +934,43 @@ def eval_model(args):
     ar_75 = recalls[5] if len(recalls) > 5 else 0.0
 
     # Compute size-specific AR metrics
-    ar_small = float(np.mean(recalls_small)) if recalls_small else 0.0
-    ar_medium = float(np.mean(recalls_medium)) if recalls_medium else 0.0
-    ar_large = float(np.mean(recalls_large)) if recalls_large else 0.0
+    ar_small_list = []
+    ar_medium_list = []
+    ar_large_list = []
+
+    for iou_thr in iou_thresholds_ar:
+        # Small
+        tp_s = results_per_size['small'][iou_thr]['tp']
+        fn_s = results_per_size['small'][iou_thr]['fn']
+        recall_s = tp_s / (tp_s + fn_s) if (tp_s + fn_s) > 0 else 0.0
+        ar_small_list.append(recall_s)
+
+        # Medium
+        tp_m = results_per_size['medium'][iou_thr]['tp']
+        fn_m = results_per_size['medium'][iou_thr]['fn']
+        recall_m = tp_m / (tp_m + fn_m) if (tp_m + fn_m) > 0 else 0.0
+        ar_medium_list.append(recall_m)
+
+        # Large
+        tp_l = results_per_size['large'][iou_thr]['tp']
+        fn_l = results_per_size['large'][iou_thr]['fn']
+        recall_l = tp_l / (tp_l + fn_l) if (tp_l + fn_l) > 0 else 0.0
+        ar_large_list.append(recall_l)
+
+    ar_small = float(np.mean(ar_small_list)) if ar_small_list else 0.0
+    ar_medium = float(np.mean(ar_medium_list)) if ar_medium_list else 0.0
+    ar_large = float(np.mean(ar_large_list)) if ar_large_list else 0.0
 
     # Create metrics dictionary
     metrics = {
         "AP": -1.0,  # AP not applicable for recall-only evaluation
         "AP50": ar_50,
         "AP75": ar_75,
-        "APs": ar_small,
+        "APs": ar_small,  # Size-specific AP (approximated from AR)
         "APm": ar_medium,
         "APl": ar_large,
         "AR": ar,
-        "ARs": ar_small,
+        "ARs": ar_small,  # Size-specific AR
         "ARm": ar_medium,
         "ARl": ar_large,
         "AR@0.5": ar_50,
@@ -900,9 +986,9 @@ def eval_model(args):
     print(f"{'AR':<12} {metrics['AR']*100:>9.1f}%  {'Average Recall @ IoU=0.50:0.95':<50}")
     print(f"{'AR@0.5':<12} {metrics['AR@0.5']*100:>9.1f}%  {'Average Recall @ IoU=0.50':<50}")
     print(f"{'AR@0.75':<12} {metrics['AR@0.75']*100:>9.1f}%  {'Average Recall @ IoU=0.75':<50}")
-    print(f"{'ARs':<12} {metrics['ARs']*100:>9.1f}%  {'Average Recall for small objects (area < 32²)':<50}")
-    print(f"{'ARm':<12} {metrics['ARm']*100:>9.1f}%  {'Average Recall for medium objects (32² < area < 96²)':<50}")
-    print(f"{'ARl':<12} {metrics['ARl']*100:>9.1f}%  {'Average Recall for large objects (area > 96²)':<50}")
+    print(f"{'ARs':<12} {metrics['ARs']*100:>9.1f}%  {'AR for small objects (area < 32^2)':<50}")
+    print(f"{'ARm':<12} {metrics['ARm']*100:>9.1f}%  {'AR for medium objects (32^2 <= area <= 96^2)':<50}")
+    print(f"{'ARl':<12} {metrics['ARl']*100:>9.1f}%  {'AR for large objects (area > 96^2)':<50}")
     print("-" * 80)
 
     # Log to WandB
@@ -995,15 +1081,15 @@ def eval_model(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="HICO-DET Grounding Evaluation with Qwen3VL")
-    parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-VL-8B-Instruct",
-                        help="Qwen3VL model name")
+    parser = argparse.ArgumentParser(description="SWIG-HOI Grounding Evaluation with InternVL3")
+    parser.add_argument("--model-name", type=str, default="OpenGVLab/InternVL3-8B",
+                        help="InternVL3 model name")
     parser.add_argument("--device", type=str, default="auto",
                         help="Device to use (auto, cuda, cuda:0, cuda:1, etc.)")
     parser.add_argument("--ann-file", type=str, required=True,
-                        help="Path to HICO grounding annotation file")
+                        help="Path to SWIG grounding annotation file")
     parser.add_argument("--img-prefix", type=str, required=True,
-                        help="Path to HICO images directory")
+                        help="Path to SWIG images directory")
     parser.add_argument("--result-file", type=str, required=True,
                         help="Output file for evaluation results")
     parser.add_argument("--max-images", type=int, default=None,
@@ -1012,7 +1098,7 @@ if __name__ == "__main__":
                         help="Show detailed per-sample results")
     parser.add_argument("--wandb", action="store_true",
                         help="Enable Weights & Biases logging")
-    parser.add_argument("--wandb-project", type=str, default="hico-grounding-qwen3vl",
+    parser.add_argument("--wandb-project", type=str, default="swig-grounding-internvl3",
                         help="W&B project name")
     parser.add_argument("--wandb-run-name", type=str, default=None,
                         help="W&B run name (auto-generated if not provided)")

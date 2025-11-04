@@ -68,6 +68,28 @@ def calculate_iou(box1, box2):
     return inter_area / union_area if union_area > 0 else 0.0
 
 
+def get_box_area(box):
+    """Calculate area of bounding box [x1, y1, x2, y2]"""
+    return (box[2] - box[0]) * (box[3] - box[1])
+
+
+def categorize_pair_by_size(gt_pair, area_small=1024, area_medium=9216):
+    """
+    Categorize a ground truth pair by object size.
+    Uses the object box area for categorization (COCO standard).
+
+    Returns: 'small', 'medium', or 'large'
+    """
+    object_area = get_box_area(gt_pair['object_box'])
+
+    if object_area < area_small:
+        return 'small'
+    elif object_area < area_medium:
+        return 'medium'
+    else:
+        return 'large'
+
+
 def parse_qwen3vl_json_response(response_text, img_shape):
     """
     Parse Qwen3VL JSON response to extract person-object pairs.
@@ -607,11 +629,21 @@ def eval_model(args):
     # Evaluation metrics at different IoU thresholds
     iou_thresholds_ar = [round(0.5 + 0.05 * i, 2) for i in range(10)]  # [0.5, 0.55, ..., 0.95]
 
+    # COCO area thresholds for small/medium/large objects
+    AREA_SMALL = 32 ** 2    # < 1024 pixels²
+    AREA_MEDIUM = 96 ** 2   # < 9216 pixels²
+
     results_per_threshold = {
         iou_thr: {
             'tp': 0,  # True positives (matched pairs)
             'fp': 0,  # False positives (unmatched predictions)
             'fn': 0,  # False negatives (unmatched GT pairs)
+            'tp_small': 0,
+            'fn_small': 0,
+            'tp_medium': 0,
+            'fn_medium': 0,
+            'tp_large': 0,
+            'fn_large': 0,
         }
         for iou_thr in iou_thresholds_ar
     }
@@ -677,12 +709,17 @@ def eval_model(args):
             print(f"  Action: {action}, Object: {object_category}")
             print(f"  GT boxes loaded: {len(gt_boxes_list)}, GT pairs: {len(gt_pairs)}")
 
+        # Build prompt for logging
+        prompt_messages = build_qwen3vl_prompt(action, object_category)
+        prompt_text = prompt_messages[0]['content'][1]['text']  # Extract the text part
+
         # Run Qwen3VL inference
         output_text, image = run_qwen3vl_inference(
             model, processor, img_path, action, object_category
         )
 
         if show_verbose:
+            print(f"  Prompt: {prompt_text[:100]}...")
             print(f"  Response: {output_text[:150]}...")
 
         # Parse predicted pairs
@@ -704,6 +741,7 @@ def eval_model(args):
             'action_object_id': sample.get('action_object_id', f"{action}_{object_category}"),
             'num_gt_pairs': len(gt_pairs),
             'num_pred_pairs': len(pred_pairs),
+            'prompt': prompt_text,
             'generated_text': output_text[:200],
             'matches_per_threshold': {}
         }
@@ -713,10 +751,21 @@ def eval_model(args):
                 pred_pairs, gt_pairs, iou_threshold=iou_thr
             )
 
-            # Update metrics
+            # Update overall metrics
             results_per_threshold[iou_thr]['tp'] += len(matches)
             results_per_threshold[iou_thr]['fp'] += len(unmatched_preds)
             results_per_threshold[iou_thr]['fn'] += len(unmatched_gts)
+
+            # Update size-specific metrics
+            matched_gt_indices = {m[1] for m in matches}
+            for gt_idx, gt_pair in enumerate(gt_pairs):
+                size_category = categorize_pair_by_size(gt_pair, AREA_SMALL, AREA_MEDIUM)
+                if gt_idx in matched_gt_indices:
+                    # This GT was matched (True Positive for this size category)
+                    results_per_threshold[iou_thr][f'tp_{size_category}'] += 1
+                else:
+                    # This GT was not matched (False Negative for this size category)
+                    results_per_threshold[iou_thr][f'fn_{size_category}'] += 1
 
             sample_result['matches_per_threshold'][iou_thr] = {
                 'matched': len(matches),
@@ -788,29 +837,57 @@ def eval_model(args):
 
     # Compute recalls at all IoU thresholds
     recalls = []
+    recalls_small = []
+    recalls_medium = []
+    recalls_large = []
+
     for iou_thr in iou_thresholds_ar:
+        # Overall recall
         tp = results_per_threshold[iou_thr]['tp']
         fn = results_per_threshold[iou_thr]['fn']
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         recalls.append(recall)
+
+        # Small object recall
+        tp_small = results_per_threshold[iou_thr]['tp_small']
+        fn_small = results_per_threshold[iou_thr]['fn_small']
+        recall_small = tp_small / (tp_small + fn_small) if (tp_small + fn_small) > 0 else 0.0
+        recalls_small.append(recall_small)
+
+        # Medium object recall
+        tp_medium = results_per_threshold[iou_thr]['tp_medium']
+        fn_medium = results_per_threshold[iou_thr]['fn_medium']
+        recall_medium = tp_medium / (tp_medium + fn_medium) if (tp_medium + fn_medium) > 0 else 0.0
+        recalls_medium.append(recall_medium)
+
+        # Large object recall
+        tp_large = results_per_threshold[iou_thr]['tp_large']
+        fn_large = results_per_threshold[iou_thr]['fn_large']
+        recall_large = tp_large / (tp_large + fn_large) if (tp_large + fn_large) > 0 else 0.0
+        recalls_large.append(recall_large)
 
     # Compute AR (Average Recall across IoU 0.5:0.95)
     ar = float(np.mean(recalls)) if recalls else 0.0
     ar_50 = recalls[0] if len(recalls) > 0 else 0.0
     ar_75 = recalls[5] if len(recalls) > 5 else 0.0
 
+    # Compute size-specific AR metrics
+    ar_small = float(np.mean(recalls_small)) if recalls_small else 0.0
+    ar_medium = float(np.mean(recalls_medium)) if recalls_medium else 0.0
+    ar_large = float(np.mean(recalls_large)) if recalls_large else 0.0
+
     # Create metrics dictionary
     metrics = {
         "AP": -1.0,  # AP not applicable for recall-only evaluation
         "AP50": ar_50,
         "AP75": ar_75,
-        "APs": ar,  # Approximation
-        "APm": ar,
-        "APl": ar,
+        "APs": ar_small,
+        "APm": ar_medium,
+        "APl": ar_large,
         "AR": ar,
-        "ARs": ar,
-        "ARm": ar,
-        "ARl": ar,
+        "ARs": ar_small,
+        "ARm": ar_medium,
+        "ARl": ar_large,
         "AR@0.5": ar_50,
         "AR@0.75": ar_75
     }
@@ -824,6 +901,9 @@ def eval_model(args):
     print(f"{'AR':<12} {metrics['AR']*100:>9.1f}%  {'Average Recall @ IoU=0.50:0.95':<50}")
     print(f"{'AR@0.5':<12} {metrics['AR@0.5']*100:>9.1f}%  {'Average Recall @ IoU=0.50':<50}")
     print(f"{'AR@0.75':<12} {metrics['AR@0.75']*100:>9.1f}%  {'Average Recall @ IoU=0.75':<50}")
+    print(f"{'ARs':<12} {metrics['ARs']*100:>9.1f}%  {'Average Recall for small objects (area < 32²)':<50}")
+    print(f"{'ARm':<12} {metrics['ARm']*100:>9.1f}%  {'Average Recall for medium objects (32² < area < 96²)':<50}")
+    print(f"{'ARl':<12} {metrics['ARl']*100:>9.1f}%  {'Average Recall for large objects (area > 96²)':<50}")
     print("-" * 80)
 
     # Log to WandB
