@@ -7,6 +7,11 @@
 # Task: Detect person-object pairs with bounding boxes
 # Metrics: COCO-style AR (Average Recall)
 #
+# Supports both Instruct and Thinking models:
+#   - Instruct models (e.g., Qwen3-VL-8B-Instruct): Standard response format
+#   - Thinking models (e.g., Qwen3-VL-8B-Thinking): Extracts final answer after </think> token
+#   - Model type is automatically detected from model name
+#
 # Usage:
 #   bash scripts/run_hico_ground_eval_qwen3vl.sh [GPU] [MODEL] [OUTPUT_DIR]
 #
@@ -18,15 +23,16 @@
 #
 #   # With optional flags (set as environment variables)
 #   VERBOSE=1 bash scripts/run_hico_ground_eval_qwen3vl.sh 0          # Show per-image results
-#   MAX_IMAGES=10 bash scripts/run_hico_ground_eval_qwen3vl.sh 0      # Test on first 10 images
+#   VERBOSE=1 MAX_IMAGES=10 bash scripts/run_hico_ground_eval_qwen3vl.sh 0 "Qwen3-VL-8B-Thinking"      # Test on first 10 images
 #   VERBOSE=1 MAX_IMAGES=10 bash scripts/run_hico_ground_eval_qwen3vl.sh 0  # Both flags
 #
 #   # With Weights & Biases logging
 #   WANDB=1 bash scripts/run_hico_ground_eval_qwen3vl.sh 0            # Enable WandB
 #   WANDB=1 WANDB_PROJECT="qwen3vl-hico" bash scripts/run_hico_ground_eval_qwen3vl.sh 0
 #
-#   # Use different model size
-#   bash scripts/run_hico_ground_eval_qwen3vl.sh 0 "Qwen/Qwen3-VL-32B-Instruct"
+#   # Use different model sizes and types
+#   bash scripts/run_hico_ground_eval_qwen3vl.sh 0 "Qwen/Qwen3-VL-32B-Instruct"   # Larger instruct model
+#   bash scripts/run_hico_ground_eval_qwen3vl.sh 0 "Qwen/Qwen3-VL-8B-Thinking"    # Thinking model
 #
 # Environment Variables:
 #   VERBOSE=1         Show per-image results

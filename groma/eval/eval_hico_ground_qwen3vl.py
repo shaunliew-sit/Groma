@@ -67,6 +67,68 @@ def calculate_iou(box1, box2):
     return inter_area / union_area if union_area > 0 else 0.0
 
 
+def extract_response_from_output(generated_ids, input_ids, processor, is_thinking_model=False):
+    """
+    Extract response text from model output, handling both thinking and instruct models.
+
+    For thinking models (e.g., Qwen3-VL-8B-Thinking):
+        - Response contains two sections: thinking + final answer
+        - Sections are separated by </think> token (ID: 151668)
+        - Only the final answer section (after </think>) contains the JSON output
+
+    For instruct models (e.g., Qwen3-VL-8B-Instruct):
+        - Response contains only the final answer (JSON output directly)
+
+    Args:
+        generated_ids: Full output token IDs from model.generate() [batch_size, seq_len]
+        input_ids: Input token IDs [batch_size, input_seq_len]
+        processor: Qwen3VL processor
+        is_thinking_model: Whether the model is a thinking model
+
+    Returns:
+        str: The final response text (JSON for parsing)
+    """
+    if is_thinking_model:
+        # Extract only the tokens after input (full generation)
+        output_ids = generated_ids[0][len(input_ids[0]):].tolist()
+
+        # Find </think> token (ID: 151668)
+        try:
+            think_token_id = 151668
+            # Find the last occurrence of </think> token
+            index = len(output_ids) - output_ids[::-1].index(think_token_id)
+
+            # Decode only the final answer section (after </think>)
+            final_answer = processor.decode(output_ids[index:], skip_special_tokens=True).strip()
+            return final_answer
+        except ValueError:
+            # No </think> token found - try to extract JSON from the response
+            full_text = processor.decode(output_ids, skip_special_tokens=True).strip()
+            print(f"  ⚠️  Warning: No </think> token found, attempting JSON extraction...")
+
+            # Try to find JSON array in the text (common pattern: [{...}, {...}])
+            json_match = re.search(r'\[\s*\{[\s\S]*?\}\s*\]', full_text)
+            if json_match:
+                print(f"  ✓ Found JSON in malformed output")
+                return json_match.group(0)
+
+            # No JSON found - return empty array to avoid crash
+            print(f"  ⚠️  Warning: No JSON found in thinking model output, returning empty array")
+            return "[]"
+    else:
+        # Instruct model: decode entire output (standard behavior)
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):]
+            for in_ids, out_ids in zip(input_ids, generated_ids)
+        ]
+        output_text = processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False
+        )[0]
+        return output_text
+
+
 def parse_qwen3vl_json_response(response_text, img_shape):
     """
     Parse Qwen3VL JSON response to extract person-object pairs.
@@ -126,6 +188,10 @@ def parse_qwen3vl_json_response(response_text, img_shape):
 
     # Convert Qwen3VL format [0, 1000] to pixel coordinates
     for det in detections:
+        # Skip non-dict items (e.g., integers or strings in malformed JSON)
+        if not isinstance(det, dict):
+            continue
+
         if "person_bbox" in det and "object_bbox" in det:
             person_bbox_qwen = det["person_bbox"]
             object_bbox_qwen = det["object_bbox"]
@@ -417,23 +483,43 @@ def visualize_qwen3vl_grounding(image_path, pred_pairs, gt_pairs, matches,
     return final_img
 
 
-def build_qwen3vl_prompt(action, object_category):
+def build_qwen3vl_prompt(action, object_category, is_thinking_model=False):
     """
     Build Qwen3VL grounding prompt for person-object pair detection.
 
     Args:
         action: Action verb (e.g., "riding", "sitting on")
         object_category: Object category (e.g., "bicycle", "bench")
+        is_thinking_model: Whether to add thinking instructions (default: False)
 
     Returns:
         List of message dicts for Qwen3VL
     """
+    # Base task and instructions
     prompt_text = (
         f"Task: Detect all person-{object_category} pairs where the person is {action} the {object_category}.\n\n"
         f"Instructions:\n"
         f"1. Identify ALL persons performing the action '{action}' with a {object_category}\n"
         f"2. For each person, identify the specific {object_category} they are interacting with\n"
         f"3. Return bounding boxes in [x1, y1, x2, y2] format\n\n"
+    )
+
+    # Add thinking section ONLY for thinking models
+    # This instructs the model to put reasoning in <think> tags and output only JSON after </think>
+    if is_thinking_model:
+        prompt_text += (
+            f"IMPORTANT - Use this exact format:\n"
+            f"<think>\n"
+            f"Step 1 - Analyze the image:\n"
+            f"- Identify each person and {object_category} (visual cues: shape, color, pose, location)\n"
+            f"- Determine which person is '{action}' which {object_category} (spatial relationship, interaction context)\n"
+            f"- Decide precise bounding boxes for each person-{object_category} pair\n"
+            f"</think>\n\n"
+            f"Then output ONLY the JSON array (no other text).\n\n"
+        )
+
+    # Output format (same for both model types)
+    prompt_text += (
         f"Output Format (JSON only, no other text):\n"
         f"[\n"
         f'  {{"pair_id": 1, "person_bbox": [x1, y1, x2, y2], "object_bbox": [x1, y1, x2, y2]}},\n'
@@ -456,7 +542,7 @@ def build_qwen3vl_prompt(action, object_category):
     ]
 
 
-def run_qwen3vl_inference(model, processor, image_path, action, object_category):
+def run_qwen3vl_inference(model, processor, image_path, action, object_category, is_thinking_model=False):
     """
     Run Qwen3VL inference for grounding task.
 
@@ -466,16 +552,17 @@ def run_qwen3vl_inference(model, processor, image_path, action, object_category)
         image_path: Path to image file
         action: Action verb
         object_category: Object category name
+        is_thinking_model: Whether the model is a thinking model (default: False)
 
     Returns:
-        output_text: Generated response text
+        output_text: Generated response text (final answer for thinking models)
         image: PIL Image object
     """
     # Load image
     image = Image.open(image_path).convert('RGB')
 
     # Build prompt
-    messages = build_qwen3vl_prompt(action, object_category)
+    messages = build_qwen3vl_prompt(action, object_category, is_thinking_model)
 
     # Replace placeholder with actual image
     for msg in messages:
@@ -494,25 +581,34 @@ def run_qwen3vl_inference(model, processor, image_path, action, object_category)
     inputs = inputs.to(model.device)
 
     # Generate
+    # Thinking models need more tokens (thinking content + JSON) and sampling enabled
+    if is_thinking_model:
+        max_tokens = 2048
+        gen_kwargs = {
+            'max_new_tokens': max_tokens,
+            'do_sample': True,
+            'temperature': 0.2,
+            'top_p': 0.9,
+            'top_k': 20,
+        }
+    else:
+        max_tokens = 512
+        gen_kwargs = {
+            'max_new_tokens': max_tokens,
+            'do_sample': False,
+            'temperature': None,
+        }
+
     with torch.inference_mode():
         generated_ids = model.generate(
             **inputs,
-            max_new_tokens=512,  # Allow for multiple pairs
-            do_sample=False,
-            temperature=None,
+            **gen_kwargs
         )
 
-    # Decode
-    generated_ids_trimmed = [
-        out_ids[len(in_ids):]
-        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    ]
-
-    output_text = processor.batch_decode(
-        generated_ids_trimmed,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False
-    )[0]
+    # Extract response text (handles both thinking and instruct models)
+    output_text = extract_response_from_output(
+        generated_ids, inputs.input_ids, processor, is_thinking_model
+    )
 
     return output_text, image
 
@@ -573,7 +669,15 @@ def eval_model(args):
     )
     processor = AutoProcessor.from_pretrained(args.model_name)
 
-    print(f"✓ Model loaded successfully on device: {model.device}\n")
+    print(f"✓ Model loaded successfully on device: {model.device}")
+
+    # Detect model type (thinking vs instruct)
+    is_thinking_model = "Thinking" in args.model_name or "thinking" in args.model_name
+    model_type = "Thinking" if is_thinking_model else "Instruct"
+    print(f"✓ Model type: {model_type}")
+    if is_thinking_model:
+        print(f"  Note: Thinking model detected - will extract final answer after </think> token")
+    print()
 
     # Initialize Weights & Biases
     use_wandb = WANDB_AVAILABLE and args.wandb
@@ -709,12 +813,12 @@ def eval_model(args):
             print(f"  GT boxes loaded: {len(gt_boxes_list)}, GT pairs: {len(gt_pairs)}")
 
         # Build prompt for logging
-        prompt_messages = build_qwen3vl_prompt(action, object_category)
+        prompt_messages = build_qwen3vl_prompt(action, object_category, is_thinking_model)
         prompt_text = prompt_messages[0]['content'][1]['text']  # Extract the text part
 
         # Run Qwen3VL inference
         output_text, image = run_qwen3vl_inference(
-            model, processor, img_path, action, object_category
+            model, processor, img_path, action, object_category, is_thinking_model
         )
 
         if show_verbose:
