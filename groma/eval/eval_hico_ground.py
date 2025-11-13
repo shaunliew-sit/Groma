@@ -65,6 +65,33 @@ def calculate_iou(box1, box2):
     return inter_area / union_area if union_area > 0 else 0.0
 
 
+def get_box_area(box):
+    """Calculate area of bounding box [x1, y1, x2, y2]"""
+    return (box[2] - box[0]) * (box[3] - box[1])
+
+
+def categorize_pair_by_size(gt_pair, area_small=1024, area_medium=9216):
+    """
+    Categorize a ground truth pair by object size.
+    Uses the object box area for categorization (COCO standard).
+
+    Args:
+        gt_pair: Dict with 'person_box' and 'object_box' keys
+        area_small: Threshold for small objects (default: 32² = 1024)
+        area_medium: Threshold for medium objects (default: 96² = 9216)
+
+    Returns: 'small', 'medium', or 'large'
+    """
+    object_area = get_box_area(gt_pair['object_box'])
+
+    if object_area < area_small:
+        return 'small'
+    elif object_area < area_medium:
+        return 'medium'
+    else:
+        return 'large'
+
+
 def parse_grounding_response(response_text, pred_boxes, img_shape):
     """
     Parse multi-line grounding response to extract person-object pairs.
@@ -573,11 +600,21 @@ def eval_model(args):
     # Use extended thresholds for AR computation (0.5 to 0.95 in 0.05 steps)
     iou_thresholds_ar = [round(0.5 + 0.05 * i, 2) for i in range(10)]  # [0.5, 0.55, ..., 0.95]
 
+    # COCO area thresholds for small/medium/large objects
+    AREA_SMALL = 32 ** 2    # < 1024 pixels²
+    AREA_MEDIUM = 96 ** 2   # < 9216 pixels²
+
     results_per_threshold = {
         iou_thr: {
             'tp': 0,  # True positives (matched pairs)
             'fp': 0,  # False positives (unmatched predictions)
             'fn': 0,  # False negatives (unmatched GT pairs)
+            'tp_small': 0,   # TP for small objects
+            'fn_small': 0,   # FN for small objects
+            'tp_medium': 0,  # TP for medium objects
+            'fn_medium': 0,  # FN for medium objects
+            'tp_large': 0,   # TP for large objects
+            'fn_large': 0,   # FN for large objects
         }
         for iou_thr in iou_thresholds_ar
     }
@@ -687,10 +724,21 @@ def eval_model(args):
                 pred_pairs, gt_pairs, iou_threshold=iou_thr
             )
 
-            # Update metrics
+            # Update overall metrics
             results_per_threshold[iou_thr]['tp'] += len(matches)
             results_per_threshold[iou_thr]['fp'] += len(unmatched_preds)
             results_per_threshold[iou_thr]['fn'] += len(unmatched_gts)
+
+            # Update size-specific metrics
+            matched_gt_indices = {m[1] for m in matches}
+            for gt_idx, gt_pair in enumerate(gt_pairs):
+                size_category = categorize_pair_by_size(gt_pair, AREA_SMALL, AREA_MEDIUM)
+                if gt_idx in matched_gt_indices:
+                    # This GT was matched (True Positive for this size category)
+                    results_per_threshold[iou_thr][f'tp_{size_category}'] += 1
+                else:
+                    # This GT was not matched (False Negative for this size category)
+                    results_per_threshold[iou_thr][f'fn_{size_category}'] += 1
 
             sample_result['matches_per_threshold'][iou_thr] = {
                 'matched': len(matches),
@@ -720,7 +768,10 @@ def eval_model(args):
         # Create visualization
         if show_verbose and viz_output_dir is not None:
             img_path = batch['img_path']
-            viz_path = os.path.join(viz_output_dir, f"{os.path.splitext(file_name)[0]}_ground.jpg")
+            # Include action and object in filename to avoid overwriting when same image has multiple HOI triplets
+            safe_action = action.replace(' ', '_')
+            safe_object = object_category.replace(' ', '_')
+            viz_path = os.path.join(viz_output_dir, f"{os.path.splitext(file_name)[0]}_{safe_action}_{safe_object}_ground.jpg")
 
             # Get matches at IoU=0.5 for visualization
             matches_05, unmatched_preds_05, unmatched_gts_05 = match_pairs_greedy(
@@ -784,48 +835,35 @@ def eval_model(args):
     ar_75 = recalls[5] if len(recalls) > 5 else 0.0  # IoU=0.75 (index 5)
 
     # Compute size-based AR (ARs, ARm, ARl)
-    # For pairs, we use the combined bounding box area (union of person + object boxes)
+    # Uses object box area for categorization (COCO standard)
     # Small: area < 32^2 = 1024, Medium: 1024 <= area < 96^2 = 9216, Large: area >= 9216
-    ar_small = 0.0
-    ar_medium = 0.0
-    ar_large = 0.0
+    recalls_small = []
+    recalls_medium = []
+    recalls_large = []
 
-    # Track recalls by size at IoU 0.5
-    tp_small, fn_small = 0, 0
-    tp_medium, fn_medium = 0, 0
-    tp_large, fn_large = 0, 0
+    for iou_thr in iou_thresholds_ar:
+        # Small object recall
+        tp_small = results_per_threshold[iou_thr]['tp_small']
+        fn_small = results_per_threshold[iou_thr]['fn_small']
+        recall_small = tp_small / (tp_small + fn_small) if (tp_small + fn_small) > 0 else 0.0
+        recalls_small.append(recall_small)
 
-    for sample_result in per_sample_results:
-        # Get GT box areas (person + object pair area)
-        gt_boxes = sample_result.get('gt_boxes', [])
-        for i in range(0, len(gt_boxes), 2):  # Process pairs
-            if i + 1 < len(gt_boxes):
-                person_box = gt_boxes[i]
-                object_box = gt_boxes[i + 1]
+        # Medium object recall
+        tp_medium = results_per_threshold[iou_thr]['tp_medium']
+        fn_medium = results_per_threshold[iou_thr]['fn_medium']
+        recall_medium = tp_medium / (tp_medium + fn_medium) if (tp_medium + fn_medium) > 0 else 0.0
+        recalls_medium.append(recall_medium)
 
-                # Calculate union area (approximate pair area)
-                x1 = min(person_box[0], object_box[0])
-                y1 = min(person_box[1], object_box[1])
-                x2 = max(person_box[2], object_box[2])
-                y2 = max(person_box[3], object_box[3])
-                area = (x2 - x1) * (y2 - y1)
+        # Large object recall
+        tp_large = results_per_threshold[iou_thr]['tp_large']
+        fn_large = results_per_threshold[iou_thr]['fn_large']
+        recall_large = tp_large / (tp_large + fn_large) if (tp_large + fn_large) > 0 else 0.0
+        recalls_large.append(recall_large)
 
-                # Categorize by size
-                if area < 1024:
-                    fn_small += 1
-                elif area < 9216:
-                    fn_medium += 1
-                else:
-                    fn_large += 1
-
-        # Count matched predictions by size (from per_sample_result)
-        # Note: This is a simplified version - full implementation would track matched pairs by size
-        # For now, use overall AR as approximation
-
-    # Compute size-based AR (using overall AR as approximation since we don't track matched pairs by size)
-    ar_small = ar  # Approximation
-    ar_medium = ar
-    ar_large = ar
+    # Compute size-specific AR metrics (average across IoU thresholds)
+    ar_small = float(np.mean(recalls_small)) if recalls_small else 0.0
+    ar_medium = float(np.mean(recalls_medium)) if recalls_medium else 0.0
+    ar_large = float(np.mean(recalls_large)) if recalls_large else 0.0
 
     # Create metrics dictionary in desired format
     metrics = {
@@ -857,7 +895,7 @@ def eval_model(args):
     print(f"{'ARl':<12} {metrics['ARl']*100:>9.1f}%  {'Large pairs (area > 96²)':<50}")
     print("-" * 80)
     print(f"\nNote: AP metrics set to -1.0 (not applicable for recall-only evaluation)")
-    print(f"      Size-based AR metrics use overall AR as approximation")
+    print(f"      Size-based AR uses object box area for categorization (COCO standard)")
 
     # Log to WandB
     if use_wandb:

@@ -18,7 +18,7 @@ datasets = [
         'type': 'hico_ground',
         'ann_file': '/Users/shaunliew/Documents/Groma/groma_data/benchmarks/hico_ground_train.json',
         'img_prefix': '/Users/shaunliew/Documents/Intent-Identification-Detection/hico_20160224_det/images/train2015',
-        'conv_temp': 'default'
+        'conv_temp': 'llava'
     },
 
     # ========================================================================
@@ -28,7 +28,7 @@ datasets = [
         'type': 'hico_action_referring',
         'ann_file': '/Users/shaunliew/Documents/Groma/groma_data/benchmarks/hico_action_referring_train.json',
         'img_prefix': '/Users/shaunliew/Documents/Intent-Identification-Detection/hico_20160224_det/images/train2015',
-        'conv_temp': 'default'
+        'conv_temp': 'llava'
     },
 
     # ========================================================================
@@ -38,7 +38,7 @@ datasets = [
         'type': 'swig_ground',
         'ann_file': '/Users/shaunliew/Documents/Groma/groma_data/benchmarks/swig_ground_train.json',
         'img_prefix': '/Users/shaunliew/Documents/Intent-Identification-Detection/swig_hoi/images_512',
-        'conv_temp': 'default'
+        'conv_temp': 'llava'
     },
 
     # ========================================================================
@@ -49,7 +49,7 @@ datasets = [
         'type': 'swig_action_referring',
         'ann_file': '/Users/shaunliew/Documents/Groma/groma_data/benchmarks/swig_action_referring_train.json',
         'img_prefix': '/Users/shaunliew/Documents/Intent-Identification-Detection/swig_hoi/images_512',
-        'conv_temp': 'default'
+        'conv_temp': 'llava'
     },
 ]
 

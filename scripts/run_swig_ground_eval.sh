@@ -125,7 +125,8 @@ fi
 
 if [ ! -z "$MAX_IMAGES" ]; then
     MAX_IMAGES_FLAG="--max-images $MAX_IMAGES"
-    echo "✓ Limiting to first $MAX_IMAGES images"
+    echo "✓ Limiting to first $MAX_IMAGES samples (HOI triplets)"
+    echo "  Note: Visualizations auto-enabled for datasets ≤100 samples"
 fi
 
 if [ ! -z "$WANDB" ]; then
