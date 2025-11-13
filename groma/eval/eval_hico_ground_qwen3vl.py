@@ -74,10 +74,11 @@ def extract_response_from_output(generated_ids, input_ids, processor, is_thinkin
     For thinking models (e.g., Qwen3-VL-8B-Thinking):
         - Response contains two sections: thinking + final answer
         - Sections are separated by </think> token (ID: 151668)
-        - Only the final answer section (after </think>) contains the JSON output
+        - Returns both the thinking content and the final answer (JSON output)
 
     For instruct models (e.g., Qwen3-VL-8B-Instruct):
         - Response contains only the final answer (JSON output directly)
+        - Returns empty string for thinking content
 
     Args:
         generated_ids: Full output token IDs from model.generate() [batch_size, seq_len]
@@ -86,7 +87,9 @@ def extract_response_from_output(generated_ids, input_ids, processor, is_thinkin
         is_thinking_model: Whether the model is a thinking model
 
     Returns:
-        str: The final response text (JSON for parsing)
+        tuple: (thinking_content: str, final_answer: str)
+            - thinking_content: The reasoning process (empty for instruct models)
+            - final_answer: The final response text (JSON for parsing)
     """
     if is_thinking_model:
         # Extract only the tokens after input (full generation)
@@ -98,9 +101,13 @@ def extract_response_from_output(generated_ids, input_ids, processor, is_thinkin
             # Find the last occurrence of </think> token
             index = len(output_ids) - output_ids[::-1].index(think_token_id)
 
+            # Extract thinking content (before </think>)
+            thinking_content = processor.decode(output_ids[:index-1], skip_special_tokens=True).strip()
+
             # Decode only the final answer section (after </think>)
             final_answer = processor.decode(output_ids[index:], skip_special_tokens=True).strip()
-            return final_answer
+
+            return thinking_content, final_answer
         except ValueError:
             # No </think> token found - try to extract JSON from the response
             full_text = processor.decode(output_ids, skip_special_tokens=True).strip()
@@ -110,11 +117,11 @@ def extract_response_from_output(generated_ids, input_ids, processor, is_thinkin
             json_match = re.search(r'\[\s*\{[\s\S]*?\}\s*\]', full_text)
             if json_match:
                 print(f"  ✓ Found JSON in malformed output")
-                return json_match.group(0)
+                return "", json_match.group(0)
 
             # No JSON found - return empty array to avoid crash
             print(f"  ⚠️  Warning: No JSON found in thinking model output, returning empty array")
-            return "[]"
+            return "", "[]"
     else:
         # Instruct model: decode entire output (standard behavior)
         generated_ids_trimmed = [
@@ -126,7 +133,7 @@ def extract_response_from_output(generated_ids, input_ids, processor, is_thinkin
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False
         )[0]
-        return output_text
+        return "", output_text
 
 
 def parse_qwen3vl_json_response(response_text, img_shape):
@@ -555,6 +562,7 @@ def run_qwen3vl_inference(model, processor, image_path, action, object_category,
         is_thinking_model: Whether the model is a thinking model (default: False)
 
     Returns:
+        thinking_content: Reasoning process (empty string for instruct models)
         output_text: Generated response text (final answer for thinking models)
         image: PIL Image object
     """
@@ -606,11 +614,11 @@ def run_qwen3vl_inference(model, processor, image_path, action, object_category,
         )
 
     # Extract response text (handles both thinking and instruct models)
-    output_text = extract_response_from_output(
+    thinking_content, output_text = extract_response_from_output(
         generated_ids, inputs.input_ids, processor, is_thinking_model
     )
 
-    return output_text, image
+    return thinking_content, output_text, image
 
 
 def eval_model(args):
@@ -817,12 +825,14 @@ def eval_model(args):
         prompt_text = prompt_messages[0]['content'][1]['text']  # Extract the text part
 
         # Run Qwen3VL inference
-        output_text, image = run_qwen3vl_inference(
+        thinking_content, output_text, image = run_qwen3vl_inference(
             model, processor, img_path, action, object_category, is_thinking_model
         )
 
         if show_verbose:
             print(f"  Prompt: {prompt_text[:100]}...")
+            if thinking_content:
+                print(f"  Thinking: {thinking_content[:150]}...")
             print(f"  Response: {output_text[:150]}...")
 
         # Parse predicted pairs
@@ -845,7 +855,8 @@ def eval_model(args):
             'num_gt_pairs': len(gt_pairs),
             'num_pred_pairs': len(pred_pairs),
             'prompt': prompt_text,
-            'generated_text': output_text[:200],
+            'thinking_content': thinking_content,
+            'generated_text': output_text,
             'matches_per_threshold': {}
         }
 
@@ -909,12 +920,25 @@ def eval_model(args):
 
                 # Log to WandB if enabled
                 if use_wandb:
-                    wandb.log({
+                    log_dict = {
                         f"visualization/{idx:04d}_{action_safe}_{object_safe}": wandb.Image(
                             viz_img,
                             caption=f"{file_name} | {action} {object_category} | Pred:{len(pred_pairs)} GT:{len(gt_pairs)} Matched:{len(matches_05_list)}"
                         )
-                    })
+                    }
+
+                    # Log thinking content if available
+                    if thinking_content:
+                        log_dict[f"thinking/{idx:04d}_{action_safe}_{object_safe}"] = wandb.Html(
+                            f"<div style='font-family: monospace; white-space: pre-wrap; padding: 10px; background-color: #f5f5f5; border-radius: 5px;'>"
+                            f"<h3>{file_name} - {action} {object_category}</h3>"
+                            f"<h4>Thinking Process:</h4>"
+                            f"{thinking_content}"
+                            f"</div>"
+                        )
+                        log_dict[f"thinking_length/{idx:04d}"] = len(thinking_content.split())
+
+                    wandb.log(log_dict)
             except Exception as e:
                 if show_verbose:
                     print(f"  Warning: Visualization failed: {e}")
@@ -1054,6 +1078,23 @@ def eval_model(args):
     with open(action_stats_file, 'w') as f:
         json.dump(action_stats_dict, f, indent=2)
 
+    # Save thinking content separately (only for samples with thinking)
+    thinking_file = args.result_file.replace('.json', '_thinking.jsonl')
+    thinking_samples = [s for s in per_sample_results if s.get('thinking_content')]
+    if thinking_samples:
+        print(f"Saving thinking content to: {thinking_file}")
+        with open(thinking_file, 'w') as f:
+            for result in thinking_samples:
+                thinking_entry = {
+                    'file_name': result['file_name'],
+                    'action': result['action'],
+                    'object': result['object'],
+                    'thinking_content': result['thinking_content'],
+                    'generated_text': result['generated_text']
+                }
+                f.write(json.dumps(thinking_entry) + '\n')
+        print(f"  Total samples with thinking: {len(thinking_samples)}/{len(per_sample_results)}")
+
     # Save and log visualizations summary
     if viz_dir is not None:
         viz_count = len([f for f in os.listdir(viz_dir) if f.endswith('.jpg')])
@@ -1066,6 +1107,8 @@ def eval_model(args):
         wandb.save(metrics_file)
         wandb.save(args.result_file)
         wandb.save(action_stats_file)
+        if thinking_samples:
+            wandb.save(thinking_file)
 
         # Create summary table for top/bottom performing actions
         action_table_data = []

@@ -10,8 +10,10 @@
 #
 # Supports both Instruct and Thinking models:
 #   - Instruct models (e.g., Qwen3-VL-8B-Instruct): Standard response format
-#   - Thinking models (e.g., Qwen3-VL-8B-Thinking): Extracts final answer after </think> token
-#   - Model type is automatically detected from model name
+#   - Thinking models (e.g., Qwen3-VL-8B-Thinking):
+#     * Extracts and saves reasoning process from <think> tags
+#     * Saves final answer after </think> token
+#     * Model type is automatically detected from model name
 #
 # Usage:
 #   bash scripts/run_swig_ground_eval_qwen3vl.sh [GPU] [MODEL] [OUTPUT_DIR]
@@ -43,10 +45,16 @@
 #   WANDB_RUN_NAME    W&B run name (default: auto-generated)
 #
 # Output files:
-#   {output_dir}/swig_ground_qwen3vl_results_{timestamp}.json          # Raw predictions
+#   {output_dir}/swig_ground_qwen3vl_results_{timestamp}.json          # Raw predictions (includes thinking_content field)
 #   {output_dir}/swig_ground_qwen3vl_results_{timestamp}_metrics.json # AR metrics
-#   {output_dir}/swig_ground_qwen3vl_results_{timestamp}_action_stats.json # Per-action
+#   {output_dir}/swig_ground_qwen3vl_results_{timestamp}_action_stats.json # Per-action stats
+#   {output_dir}/swig_ground_qwen3vl_results_{timestamp}_thinking.jsonl # Thinking process (thinking models only)
 #   {output_dir}/swig_ground_qwen3vl_evaluation_{timestamp}.log        # Full log
+#
+# For thinking models:
+#   - The main results JSON includes full thinking_content in each sample
+#   - The _thinking.jsonl file provides a clean format with just thinking content per sample
+#   - WandB logs thinking content as HTML (when WANDB=1)
 ################################################################################
 
 set -e  # Exit on error
@@ -192,6 +200,10 @@ if [ $? -eq 0 ]; then
     echo "  Predictions:    $RESULT_FILE"
     echo "  Metrics:        ${RESULT_FILE//.json/_metrics.json}"
     echo "  Action stats:   ${RESULT_FILE//.json/_action_stats.json}"
+    THINKING_FILE="${RESULT_FILE//.json/_thinking.jsonl}"
+    if [ -f "$THINKING_FILE" ]; then
+        echo "  Thinking:       $THINKING_FILE  (thinking model output)"
+    fi
     echo "  Log:            $LOG_FILE"
     echo ""
 
