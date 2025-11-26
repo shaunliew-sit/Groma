@@ -1,5 +1,28 @@
-# Training script for GromaQwenModel
+# [GROMA-QWEN] Training script for GromaQwenModel
+# Part of: Groma Qwen3VL Referring Task Implementation
 # Adapted from groma/train/train.py
+#
+# Training Stages:
+# ================
+# Stage 2 (VL Alignment Pretraining):
+#   - freeze_llm=True, freeze_perceiver=True (DINOv2 always frozen)
+#   - Trains: VL Bridge (img_txt_bridge), Region Encoder (region_encoder)
+#   - Uses: scripts/vl_pretrain_hoi_combined.sh
+#   - Config: groma/data/configs/vl_pretrain_hoi_combined.py
+#
+# Stage 3 (Instruction Finetuning):
+#   - freeze_llm=False, freeze_perceiver=True
+#   - Trains: LLM, VL Bridge, Region Encoder, New Token Embeddings
+#   - Uses: scripts/vl_finetune_referring_only.sh (referring-only)
+#   - Config: groma/data/configs/vl_finetune_referring_only_qwen.py
+#
+# Key Features:
+# -------------
+# - Supports loading from Stage 2 checkpoint for Stage 3
+# - Adds special tokens (<region>, <refer_feat>, <r0>...<r99>, etc.)
+# - Uses GromaTrainer with gradient checkpointing support
+# - Integrates with WandB for experiment tracking
+#
 
 import torch
 import pathlib

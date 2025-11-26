@@ -1,3 +1,44 @@
+"""
+[GROMA-QWEN] Groma Qwen3VL Model Implementation
+Part of: Groma Qwen3VL Referring Task Implementation
+
+Architecture Overview:
+======================
+GromaQwenModel extends Qwen3VLForConditionalGeneration to support region-level understanding.
+
+Components:
+-----------
+1. Base LLM: Qwen3VL-8B-Instruct (frozen during Stage 2, trained during Stage 3)
+2. DINOv2 Visual Encoder (vis_encoder): Extracts fine-grained visual features from region crops
+   - Model: facebook/dinov2-large (1024-dim hidden, 24 layers)
+   - Always frozen - provides robust visual representations
+3. Region Encoder (region_encoder): MLVLROIQueryModule from roi_align.py
+   - Multi-level feature fusion from last 3 DINOv2 layers
+   - ROI Align to extract features for specific bounding boxes
+   - Outputs 4096-dim region features
+4. VL Bridge (img_txt_bridge): Projects region features to LLM embedding space
+   - Linear(4096 -> text_embed_dim) + GELU + Linear(text_embed_dim -> text_embed_dim)
+   - Trained during Stage 2 & 3
+5. New Token Embeddings (new_input_embs): For special tokens like <r0>...<r99>, <region>, etc.
+   - Trained during Stage 3
+
+Key Changes for Referring Task:
+-------------------------------
+- prepare_inputs_for_generation(): Preserves region_images and refer_boxes during generation
+- forward(): Injects region features at both <region> AND <refer_feat> token positions
+  (Critical fix: originally only injected at <region>, causing referring task failures)
+- Embedding hook mechanism to inject custom embeddings while preserving RoPE compatibility
+
+Data Flow (Referring Task):
+---------------------------
+Input: Image + 2 bounding boxes (person, object) + prompt with <refer_feat> tokens
+1. Region crops -> DINOv2 -> Multi-level features (last 3 layers)
+2. Bounding boxes -> ROI Align -> Region features (4096-dim per region)
+3. Region features -> VL Bridge -> LLM-compatible embeddings
+4. Embeddings injected at <refer_feat> positions via forward hook
+5. LLM generates action description (e.g., "riding bicycle")
+"""
+
 import torch
 import torch.nn as nn
 from typing import List, Optional, Tuple, Union

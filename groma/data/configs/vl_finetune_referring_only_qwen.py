@@ -1,4 +1,5 @@
-# Stage 3: Instruction Finetuning - Referring-Only (Qwen3VL-Native Instructions)
+# [GROMA-QWEN] Stage 3: Instruction Finetuning - Referring-Only (Qwen3VL-Native Instructions)
+# Part of: Groma Qwen3VL Referring Task Implementation
 #
 # This config uses ONLY referring samples with new explicit instructions for Qwen3VL.
 # - Excludes all grounding samples to avoid task confusion

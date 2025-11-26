@@ -1,4 +1,5 @@
-# Stage 3: Instruction Finetuning - HICO-DET + SWIG-HOI Combined (Qwen-Only Grounding)
+# [GROMA-QWEN] Stage 3: Instruction Finetuning - HICO-DET + SWIG-HOI Combined (Qwen-Only Grounding)
+# Part of: Groma Qwen3VL Referring Task Implementation
 #
 # This config uses the COMBINED HOI datasets for Instruction Finetuning
 # - Uses the same datasets as Stage 2 for consistency

@@ -1,5 +1,6 @@
 #!/bin/bash
-# Stage 2: VL Alignment Pretraining - HICO + SWIG Combined
+# [GROMA-QWEN] Stage 2: VL Alignment Pretraining - HICO + SWIG Combined
+# Part of: Groma Qwen3VL Referring Task Implementation
 #
 # Usage:
 #   bash scripts/vl_pretrain_hoi_combined.sh <LLM_PATH> <PERCEIVER_PATH> <OUTPUT_DIR> [GPU_IDS] [NUM_GPUS] [RUN_NAME]

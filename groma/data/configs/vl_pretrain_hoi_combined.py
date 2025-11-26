@@ -1,4 +1,5 @@
-# Stage 2: VL Alignment Pretraining - HICO-DET + SWIG-HOI Combined
+# [GROMA-QWEN] Stage 2: VL Alignment Pretraining - HICO-DET + SWIG-HOI Combined
+# Part of: Groma Qwen3VL Referring Task Implementation
 #
 # This config uses the COMBINED HOI datasets for VL alignment
 # - Ensures consistency with Stage 3 (Finetuning)

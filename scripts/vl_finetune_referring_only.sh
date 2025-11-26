@@ -1,5 +1,6 @@
 #!/bin/bash
-# Stage 3: Instruction Finetuning - Referring Only (Qwen3VL-Native Instructions)
+# [GROMA-QWEN] Stage 3: Instruction Finetuning - Referring Only (Qwen3VL-Native Instructions)
+# Part of: Groma Qwen3VL Referring Task Implementation
 #
 # This script trains ONLY on referring samples with new explicit instructions.
 # - Excludes grounding samples to avoid task confusion

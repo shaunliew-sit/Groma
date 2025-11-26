@@ -1,5 +1,6 @@
 """
-HICO-DET Action Referring Evaluation Script for Groma Qwen3VL
+[GROMA-QWEN] HICO-DET Action Referring Evaluation Script for Groma Qwen3VL
+Part of: Groma Qwen3VL Referring Task Implementation
 
 Evaluates Groma Qwen3VL action prediction using METEOR and CIDEr metrics.
 

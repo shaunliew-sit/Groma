@@ -1,4 +1,46 @@
-# build spi query for groma
+# [GROMA-QWEN] ROI Align module for Groma Qwen3VL
+# Part of: Groma Qwen3VL Referring Task Implementation
+#
+# Architecture Overview:
+# ======================
+# This module extracts and fuses multi-level features from DINOv2 for specific regions.
+#
+# Components:
+# -----------
+# 1. MLVLFuseModule: Multi-level feature fusion with channel shuffling
+#    - Takes last 3 layers from DINOv2 (different semantic levels)
+#    - Fuses information across levels via channel shuffling
+#    - Adds 2D coordinate features for spatial awareness
+#
+# 2. MLVLROIQueryModule: Main interface called by GromaQwenModel
+#    - Reshapes DINOv2 sequence features (B, L, D) -> spatial (B, D, H, W)
+#    - Upsamples features to different resolutions for multi-scale ROI
+#    - Applies MLVLFuseModule then MlvlRoIExtractor
+#
+# 3. MlvlRoIExtractor: ROI Align with positional encoding
+#    - Applies ROI Align at each feature level
+#    - Adds positional embedding from bounding box coordinates
+#    - Projects to 4096-dim output for LLM embedding space
+#
+# Key Changes for Qwen3VL Compatibility:
+# --------------------------------------
+# - dtype consistency: Ensures bfloat16 compatibility throughout the pipeline
+#   (DINOv2 outputs float32, but Qwen3VL uses bfloat16)
+# - MLVLFuseModule._single_shuffle(): F.interpolate in float32, then convert back
+# - MLVLFuseModule.forward(): coord_feat converted to input dtype
+# - MLVLROIQueryModule.forward(): dtype conversion before/after interpolation
+# - MlvlRoIExtractor.forward(): roi_layers use float32, output converted to expected_dtype
+#
+# Data Flow:
+# ----------
+# DINOv2 features (B, L-1, 1024) x 3 levels
+#   -> Reshape to (B, 1024, H, W)
+#   -> Upsample to multi-scale: 37x37, 74x74, 148x148
+#   -> MLVLFuseModule: channel shuffle + coordinate encoding
+#   -> MlvlRoIExtractor: ROI Align (14x14 output) + position embedding
+#   -> Linear projection: 1024 -> 4096
+#   -> Output: (N_regions, 4096) features for VL Bridge
+#
 import re
 import math
 from typing import List

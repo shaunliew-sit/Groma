@@ -1,6 +1,7 @@
 #!/bin/bash
 ################################################################################
-# HICO-DET Action Referring Task Evaluation Script for Groma Qwen3VL
+# [GROMA-QWEN] HICO-DET Action Referring Task Evaluation Script for Groma Qwen3VL
+# Part of: Groma Qwen3VL Referring Task Implementation
 # Evaluates HOI action prediction using METEOR and CIDEr metrics
 #
 # Task: Given (person, object) bounding boxes, predict the action connecting them
