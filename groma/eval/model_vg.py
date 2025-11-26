@@ -1,9 +1,20 @@
 import json
 import re
 import os
+import sys
+import argparse
+
+# Handle GPU selection BEFORE importing torch
+# This must be done before any CUDA initialization
+if '--gpu-ids' in sys.argv:
+    gpu_ids_idx = sys.argv.index('--gpu-ids')
+    if gpu_ids_idx + 1 < len(sys.argv):
+        gpu_ids = sys.argv[gpu_ids_idx + 1]
+        os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids
+        print(f"Setting CUDA_VISIBLE_DEVICES={gpu_ids} before importing torch")
+
 import torch
 import random
-import argparse
 from transformers import AutoTokenizer
 from torch.utils.data import DataLoader, DistributedSampler
 from mmdet.core.bbox.transforms import bbox_xyxy_to_cxcywh
@@ -133,6 +144,8 @@ if __name__ == "__main__":
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--local_rank', default=-1, type=int)
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+    parser.add_argument('--gpu-ids', type=str, default=None,
+                        help='Comma-separated list of GPU IDs to use (e.g., "0,2,5"). If not specified, uses all available GPUs.')
     args = parser.parse_args()
 
     init_distributed_mode(args)

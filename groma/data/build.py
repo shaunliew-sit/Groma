@@ -13,6 +13,7 @@ from groma.data.datasets.llava import LLaVAInstruct
 from groma.data.datasets.groma import GromaInstruct
 from groma.data.datasets.visual_genome import SingleRoundVG, MultiRoundsVG
 from groma.data.datasets.det_data import ClassAgnosticCoCo, ClassAgnosticSA1B
+from groma.data.datasets.groma_qwen import GromaInstructQwen
 
 
 def build_multi_datasets(dataset_cfg_file, tokenizer=None, **kwargs):
@@ -50,6 +51,20 @@ def build_dataset(dataset_cfg, tokenizer=None, **kwargs):
         dataset = LLaVAInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
     elif dataset_type == 'groma_instruct':
         dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
+    elif dataset_type == 'hico_hoi_instruct':
+        dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
+    elif dataset_type == 'swig_hoi_instruct':
+        dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
+    elif dataset_type == 'hico_ground':
+        dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
+    elif dataset_type == 'swig_ground':
+        dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
+    elif dataset_type == 'hico_action_referring':
+        dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
+    elif dataset_type == 'swig_action_referring':
+        dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
+    elif dataset_type == 'groma_qwen_instruct':
+        dataset = GromaInstructQwen(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
     else:
         raise NotImplementedError
 

@@ -6,9 +6,9 @@ from transformers.trainer import (
     has_length,
     get_parameter_names,
     is_sagemaker_mp_enabled,
-    ALL_LAYERNORM_LAYERS,
-    ShardedDDPOption,
 )
+
+ALL_LAYERNORM_LAYERS = [torch.nn.LayerNorm]
 
 
 class RandomBatchSampler(Sampler):
@@ -60,15 +60,18 @@ class RandomBatchSampler(Sampler):
 
 
 class GromaTrainer(Trainer):
-    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
-        if self.train_dataset is None or not has_length(self.train_dataset):
+    def _get_train_sampler(self, dataset=None) -> Optional[torch.utils.data.Sampler]:
+        if dataset is None:
+            dataset = self.train_dataset
+
+        if dataset is None or not has_length(dataset):
             return None
 
         if self.args.group_by_data_source:
-            cumu_sizes = self.train_dataset.cumulative_sizes
+            cumu_sizes = dataset.cumulative_sizes
             dataset_sizes = [cumu_sizes[0]] + [cumu_sizes[i] - cumu_sizes[i - 1] for i in range(1, len(cumu_sizes))]
             return RandomBatchSampler(
-                self.train_dataset,
+                dataset,
                 self.args.train_batch_size * self.args.gradient_accumulation_steps,
                 dataset_sizes
             )
@@ -78,8 +81,8 @@ class GromaTrainer(Trainer):
     def create_optimizer(self):
         if is_sagemaker_mp_enabled():
             return super().create_optimizer()
-        if self.sharded_ddp == ShardedDDPOption.SIMPLE:
-            return super().create_optimizer()
+        # if self.sharded_ddp == ShardedDDPOption.SIMPLE:
+        #     return super().create_optimizer()
 
         opt_model = self.model
         if self.optimizer is None:

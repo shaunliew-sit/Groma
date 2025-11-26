@@ -28,3 +28,19 @@ data_images/
 data
 swig_full_eval
 hico_full_eval
+esults-redo-groma
+esults-redo
+output_test-v1
+output-qwen-stage3-hoi
+output-qwen-stage3-hoi-refer
+output-test-v1
+results
+results-new
+results-new-2
+results-new-3
+results-redo-groma
+results-redo
+visual_genome_images
+# ignore all __pycache__ folders in the project
+__pycache__/*
+**/*/*/*/*/*/*/*/*/__pycache__/

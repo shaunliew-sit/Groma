@@ -118,7 +118,7 @@ class MLVLFuseModule(nn.Module):
     def generate_coordinate(self, featmap_sizes, device='cuda'):
         x_range = torch.linspace(-1, 1, featmap_sizes[-1], device=device)
         y_range = torch.linspace(-1, 1, featmap_sizes[-2], device=device)
-        y, x = torch.meshgrid(y_range, x_range)
+        y, x = torch.meshgrid(y_range, x_range, indexing='ij')
         y = y.expand([featmap_sizes[0], 1, -1, -1])
         x = x.expand([featmap_sizes[0], 1, -1, -1])
         coord_feat = torch.cat([x, y], 1)
@@ -150,6 +150,8 @@ class MLVLFuseModule(nn.Module):
     def _single_shuffle(self, inputs, conv_module):
         if not isinstance(conv_module, (nn.ModuleList, list)):
             conv_module = [conv_module]
+        # Get dtype from inputs to ensure consistency
+        input_dtype = inputs[0].dtype
         for single_conv_m in conv_module:
             fused_inputs = []
             for fuse_lvl_tuple in self.fuse_lvl_list:
@@ -161,16 +163,18 @@ class MLVLFuseModule(nn.Module):
                 from_top = top_input[:,
                            self.remain_chs:][:,
                            self.shuffle_channles:]
+                # Interpolate in float32 for precision, then convert back to input dtype
                 from_top = F.interpolate(from_top.to(torch.float32),
                                          size=tar_input.shape[-2:],
                                          mode='bilinear',
-                                         align_corners=True)
+                                         align_corners=True).to(dtype=input_dtype)
                 from_down = down_input[:, self.remain_chs:][:, :self.
                 shuffle_channles]
+                # Interpolate in float32 for precision, then convert back to input dtype
                 from_down = F.interpolate(from_down.to(torch.float32),
                                           size=tar_input.shape[-2:],
                                           mode='bilinear',
-                                          align_corners=True)
+                                          align_corners=True).to(dtype=input_dtype)
                 fused_inputs.append(
                     torch.cat([remain, from_top, from_down], dim=1))
             fused_inputs = [single_conv_m(item) for item in fused_inputs]
@@ -179,9 +183,13 @@ class MLVLFuseModule(nn.Module):
 
     def forward(self, inputs):
         feat_size = [item.shape for item in inputs]
+        # Get dtype from inputs to ensure consistency
+        input_dtype = inputs[0].dtype
         new_inputs = []
         for feat, single_feat_size in zip(inputs, feat_size):
             coord_feat = self.generate_coordinate(single_feat_size, device=inputs[0].device)
+            # Ensure coord_feat matches input dtype (coord_feat is float32 by default)
+            coord_feat = coord_feat.to(dtype=input_dtype)
             feat = torch.cat([feat, coord_feat], dim=1)
             new_inputs.append(feat)
         inputs = new_inputs
@@ -213,6 +221,10 @@ class MLVLROIQueryModule(nn.Module):
         self.roi_align = MlvlRoIExtractor(**bbox_roi_extractor)
 
     def forward(self, mlvl_feats, bboxes):
+        # Ensure dtype consistency - convert to match mlvl_fuse module dtype
+        expected_dtype = next(self.mlvl_fuse.parameters()).dtype
+        mlvl_feats = [f.to(dtype=expected_dtype) for f in mlvl_feats]
+        
         if mlvl_feats[0].dim() == 3:
             h = w = int(math.sqrt(mlvl_feats[0].shape[1]))
             b, c = mlvl_feats[0].shape[0], mlvl_feats[0].shape[-1]
@@ -225,6 +237,11 @@ class MLVLROIQueryModule(nn.Module):
             feat = mlvl_feats[level]
             shape = to_shape[level]
             mlvl_feats[level] = F.interpolate(feat, size=shape, mode='bilinear', align_corners=True)
+        
+        # Ensure dtype consistency after interpolation (interpolate may change dtype)
+        expected_dtype = next(self.mlvl_fuse.parameters()).dtype
+        mlvl_feats = [f.to(dtype=expected_dtype) for f in mlvl_feats]
+        
         mlvl_feats = self.mlvl_fuse(mlvl_feats)
 
         return self.roi_align(mlvl_feats, bboxes)
@@ -273,9 +290,17 @@ class MlvlRoIExtractor(BaseRoIExtractor):
 
     def forward(self, feats, rois, roi_scale_factor=None):
         """Forward function."""
+        # Get expected dtype from model parameters
+        expected_dtype = next(self.pos_embedd.parameters()).dtype
+        
         num_imgs = len(rois)
         batched_rois = torch.cat(rois, dim=0)
+        # Convert rois to match pos_embedd dtype (bfloat16)
+        batched_rois = batched_rois.to(dtype=expected_dtype)
         pos_embedd = self.pos_embedd(batched_rois)
+        # Ensure feats are in the correct dtype
+        feats = [f.to(dtype=expected_dtype) for f in feats]
+        
         out_size = self.roi_layers[0].output_size
         num_levels = len(feats)
         if feats[0].dim() == 3:
@@ -287,8 +312,8 @@ class MlvlRoIExtractor(BaseRoIExtractor):
         new_rois = []
         for img_id, single_img_roi in enumerate(rois):
             # rescale to original img scale
-            single_img_roi = single_img_roi * 448
-            roi_img_id = single_img_roi.new_ones(len(single_img_roi)) * img_id
+            single_img_roi = single_img_roi.to(dtype=expected_dtype) * 448
+            roi_img_id = single_img_roi.new_ones(len(single_img_roi), dtype=expected_dtype) * img_id
             single_img_roi = torch.cat([roi_img_id[:, None], single_img_roi], dim=1)
             new_rois.append(single_img_roi)
         rois = torch.cat(new_rois)
@@ -299,10 +324,9 @@ class MlvlRoIExtractor(BaseRoIExtractor):
         for i in range(num_levels):
             if len(rois) > 0:
                 rois_ = rois
-                ori_dtype = feats[i].dtype
+                # roi_layers need float32 for precision, but convert back to expected_dtype
                 roi_feats_t = self.roi_layers[i](feats[i].to(torch.float32), rois_.to(torch.float32))
-
-                roi_feats[i] = roi_feats_t.to(ori_dtype)
+                roi_feats[i] = roi_feats_t.to(dtype=expected_dtype)
 
             else:
                 roi_feats += sum(

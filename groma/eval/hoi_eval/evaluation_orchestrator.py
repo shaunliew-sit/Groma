@@ -2,7 +2,12 @@
 
 import os
 import json
+import pickle
 import datetime
+import logging
+import traceback
+import time
+from pathlib import Path
 import torch
 import numpy as np
 from transformers import AutoTokenizer, AutoImageProcessor, BitsAndBytesConfig
@@ -30,21 +35,118 @@ class HOIEvaluationOrchestrator:
         self.vis_processor = None
         self.hoi_extractor = None
         self.evaluator = None
+        self.logger = None
 
         # Create timestamped output directory for this run
         self.timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.timestamped_output_dir = None
+        self.checkpoint_file = None
+        self.checkpoint_interval = getattr(args, 'checkpoint_interval', 50)  # Save every N images
+
         if hasattr(args, 'output_dir') and args.output_dir:
-            # Create timestamped subfolder: output_dir/YYYY-MM-DD_HH-MM-SS/
-            self.timestamped_output_dir = os.path.join(args.output_dir, self.timestamp)
-            os.makedirs(self.timestamped_output_dir, exist_ok=True)
-            print(f"📁 Created timestamped output directory: {self.timestamped_output_dir}")
+            # Check if resuming from an existing directory
+            if getattr(args, '_resume_mode', False) and getattr(args, '_resume_dir', None):
+                # Use existing directory for resume
+                self.timestamped_output_dir = args._resume_dir
+                print(f"📁 Resuming in existing directory: {self.timestamped_output_dir}")
+            else:
+                # Create timestamped subfolder: output_dir/YYYY-MM-DD_HH-MM-SS/
+                self.timestamped_output_dir = os.path.join(args.output_dir, self.timestamp)
+                os.makedirs(self.timestamped_output_dir, exist_ok=True)
+                print(f"📁 Created timestamped output directory: {self.timestamped_output_dir}")
 
             # Create organized subfolders within the timestamped directory
             self.hoi_triplets_dir = os.path.join(self.timestamped_output_dir, "hoi_triplets")
             self.comparison_dir = os.path.join(self.timestamped_output_dir, "comparison")
             os.makedirs(self.hoi_triplets_dir, exist_ok=True)
             os.makedirs(self.comparison_dir, exist_ok=True)
+
+            # Setup checkpoint file path
+            self.checkpoint_file = os.path.join(self.timestamped_output_dir, "checkpoint.pkl")
+
+            # Setup logging
+            self.setup_logging()
+
+    def setup_logging(self):
+        """Setup comprehensive file and console logging."""
+        if not self.timestamped_output_dir:
+            return
+
+        # Create logger
+        self.logger = logging.getLogger(f'HOIEval_{self.timestamp}')
+        self.logger.setLevel(logging.DEBUG)
+
+        # Clear any existing handlers
+        self.logger.handlers = []
+
+        # File handler with detailed logging
+        log_file = os.path.join(self.timestamped_output_dir, 'evaluation.log')
+        file_handler = logging.FileHandler(log_file, mode='a')
+        file_handler.setLevel(logging.DEBUG)
+        file_formatter = logging.Formatter(
+            '%(asctime)s | %(levelname)-8s | %(funcName)s:%(lineno)d | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(file_formatter)
+        self.logger.addHandler(file_handler)
+
+        # Console handler with less detail
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+        console_handler.setFormatter(console_formatter)
+        self.logger.addHandler(console_handler)
+
+        self.logger.info(f"Logging initialized. Log file: {log_file}")
+        self.logger.info(f"Checkpoint interval: {self.checkpoint_interval} images")
+
+    def save_checkpoint(self, processed_images, all_predictions, detailed_results, processed_count):
+        """Save checkpoint to resume from in case of crash."""
+        if not self.checkpoint_file:
+            return
+
+        checkpoint_data = {
+            'timestamp': datetime.datetime.now().isoformat(),
+            'processed_images': processed_images,  # List of processed image IDs
+            'all_predictions': all_predictions,
+            'detailed_results': detailed_results,
+            'processed_count': processed_count,
+            'checkpoint_interval': self.checkpoint_interval
+        }
+
+        try:
+            # Save to temporary file first, then rename (atomic operation)
+            temp_file = self.checkpoint_file + '.tmp'
+            with open(temp_file, 'wb') as f:
+                pickle.dump(checkpoint_data, f)
+            os.replace(temp_file, self.checkpoint_file)
+
+            if self.logger:
+                self.logger.info(f"✓ Checkpoint saved: {processed_count} images processed")
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Failed to save checkpoint: {str(e)}")
+                self.logger.debug(traceback.format_exc())
+
+    def load_checkpoint(self):
+        """Load checkpoint if it exists to resume evaluation."""
+        if not self.checkpoint_file or not os.path.exists(self.checkpoint_file):
+            return None
+
+        try:
+            with open(self.checkpoint_file, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+
+            if self.logger:
+                self.logger.info(f"✓ Loaded checkpoint: {checkpoint_data['processed_count']} images already processed")
+                self.logger.info(f"   Last checkpoint: {checkpoint_data['timestamp']}")
+
+            return checkpoint_data
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Failed to load checkpoint: {str(e)}")
+                self.logger.debug(traceback.format_exc())
+            return None
 
     def setup_model(self):
         """Setup the Groma model and related components."""
@@ -224,11 +326,21 @@ class HOIEvaluationOrchestrator:
             'metrics': metrics
         }
 
-    def evaluate_dataset(self, dataset_type, data_root, max_images=None, batch_size=1):
-        """Evaluate an entire dataset with batch processing."""
+    def evaluate_dataset(self, dataset_type, data_root, max_images=None, batch_size=1, wandb_log=None):
+        """Evaluate an entire dataset with batch processing.
+
+        Args:
+            wandb_log: Optional wandb logging function to call with intermediate metrics
+        """
         print(f"\n{'='*80}")
         print(f"DATASET EVALUATION: {dataset_type.upper()}")
         print(f"{'='*80}")
+
+        if self.logger:
+            self.logger.info(f"Starting dataset evaluation: {dataset_type}")
+            self.logger.info(f"Data root: {data_root}")
+            self.logger.info(f"Max images: {max_images}")
+            self.logger.info(f"Batch size: {batch_size}")
 
         # Load dataset
         dataset = load_dataset(dataset_type, data_root, max_images)
@@ -237,8 +349,32 @@ class HOIEvaluationOrchestrator:
         else:
             print(f"Loaded {len(dataset)} images from {dataset_type} dataset (full set)")
 
+        if self.logger:
+            self.logger.info(f"Dataset loaded: {len(dataset)} images")
+
         # Setup evaluator
         self.setup_evaluator(dataset_type)
+
+        # Try to load checkpoint
+        checkpoint = self.load_checkpoint()
+        processed_images_set = set()
+        all_predictions = {}
+        detailed_results = {}
+        processed_count = 0
+
+        if checkpoint:
+            processed_images_set = set(checkpoint['processed_images'])
+            all_predictions = checkpoint['all_predictions']
+            detailed_results = checkpoint['detailed_results']
+            processed_count = checkpoint['processed_count']
+
+            print(f"🔄 Resuming from checkpoint: {processed_count} images already processed")
+            if self.logger:
+                self.logger.info(f"Resuming from checkpoint: {processed_count}/{len(dataset)} images completed")
+        else:
+            print(f"🆕 Starting fresh evaluation (no checkpoint found)")
+            if self.logger:
+                self.logger.info("Starting fresh evaluation")
 
         # Memory management and batch size adjustment
         if torch.cuda.is_available():
@@ -261,11 +397,16 @@ class HOIEvaluationOrchestrator:
 
             torch.cuda.empty_cache()
 
-        print(f"Starting evaluation on {len(dataset)} images with batch size {batch_size}...")
+        remaining = len(dataset) - processed_count
+        print(f"Starting evaluation on {remaining} remaining images with batch size {batch_size}...")
 
-        all_predictions = {}
-        detailed_results = {}
-        processed_count = 0
+        # Running metrics for wandb
+        running_precision = []
+        running_recall = []
+        running_triplets = []
+
+        # Track failed images
+        failed_images = []
 
         # HOI query prompt
         hoi_query = "[grounding] Describe what each person is doing with objects individually. Focus on actions only."
@@ -273,44 +414,92 @@ class HOIEvaluationOrchestrator:
         # Process dataset in batches
         from tqdm import tqdm
         num_batches = (len(dataset) + batch_size - 1) // batch_size
-        progress_bar = tqdm(total=len(dataset), desc=f"Processing {dataset_type.upper()} images")
+        progress_bar = tqdm(initial=processed_count, total=len(dataset), desc=f"Processing {dataset_type.upper()} images")
 
         for batch_idx in range(num_batches):
             batch_start = batch_idx * batch_size
             batch_end = min(batch_start + batch_size, len(dataset))
             batch_samples = dataset[batch_start:batch_end]
 
+            # Filter out already processed images
+            batch_samples_filtered = []
+            skipped_in_batch = 0
+            for data_item in batch_samples:
+                if data_item['image_id'] in processed_images_set:
+                    skipped_in_batch += 1
+                    progress_bar.update(1)
+                else:
+                    batch_samples_filtered.append(data_item)
+
+            if not batch_samples_filtered:
+                if self.logger:
+                    self.logger.debug(f"Batch {batch_idx + 1}/{num_batches}: All {len(batch_samples)} images already processed, skipping")
+                continue
+
+            if self.logger:
+                self.logger.info(f"Batch {batch_idx + 1}/{num_batches}: Processing {len(batch_samples_filtered)} images (skipped {skipped_in_batch})")
+
             try:
-                print(f"\n🔄 Processing batch {batch_idx + 1}/{num_batches} (images {batch_start + 1}-{batch_end})")
+                print(f"\n🔄 Processing batch {batch_idx + 1}/{num_batches} ({len(batch_samples_filtered)} images, {skipped_in_batch} skipped)")
 
                 # Load and preprocess images in batch
                 batch_images = []
                 batch_image_info = []
 
-                for data_item in batch_samples:
+                for data_item in batch_samples_filtered:
+                    image_id = data_item['image_id']
                     image_path = data_item['image_path']
-                    raw_image = load_image(image_path)
 
-                    # Resize to 448x448 (square) as required by Groma model
-                    processed_image = raw_image.resize((448, 448))
-                    image_processed = self.vis_processor.preprocess(processed_image, return_tensors='pt')['pixel_values'][0]
-                    image_tensor = image_processed.unsqueeze(0)
+                    try:
+                        raw_image = load_image(image_path)
 
-                    batch_images.append(image_tensor)
-                    batch_image_info.append({
-                        'data_item': data_item,
-                        'raw_image': raw_image,
-                        'image_width': raw_image.size[0],
-                        'image_height': raw_image.size[1]
-                    })
+                        # Resize to 448x448 (square) as required by Groma model
+                        processed_image = raw_image.resize((448, 448))
+                        image_processed = self.vis_processor.preprocess(processed_image, return_tensors='pt')['pixel_values'][0]
+                        image_tensor = image_processed.unsqueeze(0)
+
+                        batch_images.append(image_tensor)
+                        batch_image_info.append({
+                            'data_item': data_item,
+                            'raw_image': raw_image,
+                            'image_width': raw_image.size[0],
+                            'image_height': raw_image.size[1]
+                        })
+
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.error(f"Failed to load image {image_id} ({image_path}): {str(e)}")
+                            self.logger.debug(traceback.format_exc())
+                        failed_images.append({'image_id': image_id, 'error': str(e), 'stage': 'loading'})
+                        progress_bar.update(1)
+                        continue
+
+                if not batch_images:
+                    if self.logger:
+                        self.logger.warning(f"Batch {batch_idx + 1}: All images failed to load")
+                    continue
 
                 # Move batch to GPU
                 batch_images = [img.cuda() for img in batch_images]
 
                 # Generate responses for the batch
-                batch_results = generate_hoi_response_batch(
-                    self.model, self.tokenizer, self.vis_processor, batch_images, hoi_query, batch_size=len(batch_images)
-                )
+                try:
+                    batch_results = generate_hoi_response_batch(
+                        self.model, self.tokenizer, self.vis_processor, batch_images, hoi_query, batch_size=len(batch_images)
+                    )
+                except Exception as e:
+                    if self.logger:
+                        self.logger.error(f"Batch {batch_idx + 1}: Model inference failed: {str(e)}")
+                        self.logger.debug(traceback.format_exc())
+                    for img_info in batch_image_info:
+                        failed_images.append({
+                            'image_id': img_info['data_item']['image_id'],
+                            'error': str(e),
+                            'stage': 'inference'
+                        })
+                        progress_bar.update(1)
+                    torch.cuda.empty_cache()
+                    continue
 
                 # Process each result in the batch
                 for i, (response_text, coordinates_info) in enumerate(batch_results):
@@ -321,108 +510,221 @@ class HOIEvaluationOrchestrator:
                     image_id = data_item['image_id']
                     image_path = data_item['image_path']
 
-                    print(f"  [{batch_start + i + 1}/{len(dataset)}] Processing image {image_id}: {os.path.basename(image_path)}")
+                    try:
+                        image_start_time = time.time()
 
-                    # Load ground truth for this image
-                    gt_data = data_item  # Dataset already includes ground truth
-                    gt_hois = extract_ground_truth_hois(gt_data, dataset_type)
-                    print(f"DEBUG: Orchestrator loaded {len(gt_hois)} ground truth HOIs for image {image_id}")
+                        print(f"  [{processed_count + 1}/{len(dataset)}] Processing image {image_id}: {os.path.basename(image_path)}")
+                        if self.logger:
+                            self.logger.debug(f"Processing image {image_id}: {image_path}")
 
-                    # Extract HOI triplets
-                    entities = self.hoi_extractor.parse_grounded_response(response_text)
-                    triplets = self.hoi_extractor.extract_hoi_triplets(
-                        response_text, entities, coordinates_info, dataset_type
-                    )
+                        # Load ground truth for this image
+                        gt_data = data_item  # Dataset already includes ground truth
+                        gt_hois = extract_ground_truth_hois(gt_data, dataset_type)
+                        if self.logger:
+                            self.logger.debug(f"Image {image_id}: Loaded {len(gt_hois)} ground truth HOIs")
 
-                    # Prepare visualization triplets
-                    viz_triplets = self.hoi_extractor.prepare_visualization_triplets(triplets, dataset_type)
-
-                    # Convert to predictions for evaluation
-                    predictions = self.hoi_extractor.convert_triplets_to_predictions(
-                        triplets, image_id, image_width, image_height, dataset_type
-                    )
-
-                    # Calculate metrics
-                    metrics = None
-                    print(f"DEBUG: Before metrics calculation - gt_hois: {len(gt_hois)}, predictions: {len(predictions)}")
-                    if gt_hois:
-                        print(f"DEBUG: Ground truth HOI IDs: {[gt['hoi_id'] for gt in gt_hois]}")
-                    if predictions:
-                        print(f"DEBUG: Prediction HOI IDs: {[pred[0] for pred in predictions]}")
-                    if gt_hois and predictions:
-                        print(f"DEBUG: Calling calculate_single_image_metrics with {len(gt_hois)} gt_hois and {len(predictions)} predictions")
-                        metrics = calculate_single_image_metrics(predictions, gt_hois, image_width, image_height)
-                    else:
-                        print(f"DEBUG: Skipping metrics calculation - gt_hois: {len(gt_hois)}, predictions: {len(predictions)}")
-
-                    # Store predictions for final evaluation
-                    if predictions:
-                        all_predictions[image_id] = predictions
-
-                    # Create visualizations
-                    if self.timestamped_output_dir:
-                        visualizer = HOIVisualizer(raw_image)
-
-                        # Basic triplet visualization
-                        viz_path = os.path.join(self.hoi_triplets_dir,
-                                             f"{os.path.splitext(os.path.basename(image_path))[0]}_hoi_triplets.jpg")
-                        visualizer.visualize_triplets(viz_triplets, coordinates_info, viz_path)
-
-                        # Comparison visualization
-                        comp_path = os.path.join(self.comparison_dir,
-                                               f"{os.path.splitext(os.path.basename(image_path))[0]}_comparison.jpg")
-                        visualizer.visualize_comparison(
-                            viz_triplets, coordinates_info, gt_hois, metrics, comp_path, dataset_type
+                        # Extract HOI triplets
+                        entities = self.hoi_extractor.parse_grounded_response(response_text)
+                        triplets = self.hoi_extractor.extract_hoi_triplets(
+                            response_text, entities, coordinates_info, dataset_type
                         )
 
-                    # Store detailed results
-                    detailed_results[image_id] = {
-                        'file_name': os.path.basename(image_path),
-                        'triplets_found': len(viz_triplets),
-                        'predictions_count': len(predictions),
-                        'gt_count': len(gt_hois),
-                        'metrics': metrics,
-                        'extracted_hoi_triplets': [
-                            {
-                                'human': triplet['human']['text'],
-                                'human_region_id': triplet['human']['region_id'],
-                                'action': triplet['action'],
-                                'original_action': triplet.get('original_action', triplet['action']),
-                                'object': triplet['object']['text'],
-                                'object_region_id': triplet['object']['region_id'],
-                                'confidence': triplet.get('confidence', 0.0),
-                                'mapping_status': triplet.get('mapping_status', 'unknown'),
-                                'hoi_id': triplet.get('hoi_id'),
-                                'evaluation_eligible': triplet.get('evaluation_eligible', False)
-                            }
-                            for triplet in viz_triplets
-                        ]
-                    }
+                        # Prepare visualization triplets
+                        viz_triplets = self.hoi_extractor.prepare_visualization_triplets(triplets, dataset_type)
 
-                    processed_count += 1
-                    progress_bar.update(1)
+                        # Convert to predictions for evaluation
+                        predictions = self.hoi_extractor.convert_triplets_to_predictions(
+                            triplets, image_id, image_width, image_height, dataset_type
+                        )
+
+                        if self.logger:
+                            self.logger.debug(f"Image {image_id}: Extracted {len(triplets)} triplets, {len(predictions)} predictions")
+
+                        # Calculate metrics
+                        metrics = None
+                        if gt_hois and predictions:
+                            metrics = calculate_single_image_metrics(predictions, gt_hois, image_width, image_height)
+                            if self.logger:
+                                self.logger.debug(f"Image {image_id}: Metrics - Precision: {metrics.get('precision', 0):.3f}, Recall: {metrics.get('recall', 0):.3f}")
+
+                        # Store predictions for final evaluation
+                        if predictions:
+                            all_predictions[image_id] = predictions
+
+                        # Create visualizations
+                        if self.timestamped_output_dir:
+                            try:
+                                visualizer = HOIVisualizer(raw_image)
+
+                                # Basic triplet visualization
+                                viz_path = os.path.join(self.hoi_triplets_dir,
+                                                     f"{os.path.splitext(os.path.basename(image_path))[0]}_hoi_triplets.jpg")
+                                visualizer.visualize_triplets(viz_triplets, coordinates_info, viz_path)
+
+                                # Comparison visualization
+                                comp_path = os.path.join(self.comparison_dir,
+                                                       f"{os.path.splitext(os.path.basename(image_path))[0]}_comparison.jpg")
+                                visualizer.visualize_comparison(
+                                    viz_triplets, coordinates_info, gt_hois, metrics, comp_path, dataset_type
+                                )
+                            except Exception as e:
+                                if self.logger:
+                                    self.logger.error(f"Image {image_id}: Visualization failed: {str(e)}")
+
+                        # Store detailed results
+                        detailed_results[image_id] = {
+                            'file_name': os.path.basename(image_path),
+                            'triplets_found': len(viz_triplets),
+                            'predictions_count': len(predictions),
+                            'gt_count': len(gt_hois),
+                            'metrics': metrics,
+                            'processing_time': time.time() - image_start_time,
+                            'extracted_hoi_triplets': [
+                                {
+                                    'human': triplet['human']['text'],
+                                    'human_region_id': triplet['human']['region_id'],
+                                    'action': triplet['action'],
+                                    'original_action': triplet.get('original_action', triplet['action']),
+                                    'object': triplet['object']['text'],
+                                    'object_region_id': triplet['object']['region_id'],
+                                    'confidence': triplet.get('confidence', 0.0),
+                                    'mapping_status': triplet.get('mapping_status', 'unknown'),
+                                    'hoi_id': triplet.get('hoi_id'),
+                                    'evaluation_eligible': triplet.get('evaluation_eligible', False)
+                                }
+                                for triplet in viz_triplets
+                            ]
+                        }
+
+                        # Mark as processed
+                        processed_images_set.add(image_id)
+                        processed_count += 1
+                        progress_bar.update(1)
+
+                        # Track running metrics
+                        if metrics:
+                            running_precision.append(metrics.get('precision', 0))
+                            running_recall.append(metrics.get('recall', 0))
+                        running_triplets.append(len(viz_triplets))
+
+                        # Save checkpoint periodically
+                        if processed_count % self.checkpoint_interval == 0:
+                            self.save_checkpoint(
+                                list(processed_images_set),
+                                all_predictions,
+                                detailed_results,
+                                processed_count
+                            )
+
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.error(f"Image {image_id}: Processing failed: {str(e)}")
+                            self.logger.debug(traceback.format_exc())
+                        failed_images.append({
+                            'image_id': image_id,
+                            'error': str(e),
+                            'stage': 'processing'
+                        })
+                        progress_bar.update(1)
+                        continue
+
+                    # Log intermediate metrics to wandb
+                    if wandb_log and metrics:
+                        avg_precision = sum(running_precision) / len(running_precision) if running_precision else 0
+                        avg_recall = sum(running_recall) / len(running_recall) if running_recall else 0
+                        avg_triplets = sum(running_triplets) / len(running_triplets) if running_triplets else 0
+
+                        wandb_log({
+                            "progress/processed_images": processed_count,
+                            "progress/current_precision": metrics.get('precision', 0),
+                            "progress/current_recall": metrics.get('recall', 0),
+                            "progress/current_triplets": len(viz_triplets),
+                            "progress/avg_precision": avg_precision,
+                            "progress/avg_recall": avg_recall,
+                            "progress/avg_triplets": avg_triplets,
+                        })
+
+                    # Log sample visualizations periodically (every 100 images)
+                    if wandb_log and processed_count % 100 == 0:
+                        recent_vis = os.path.join(self.comparison_dir,
+                                                 f"{os.path.splitext(os.path.basename(image_path))[0]}_comparison.jpg")
+                        if os.path.exists(recent_vis):
+                            try:
+                                import wandb
+                                wandb_log({
+                                    f"progress_visualizations/sample_{processed_count}": wandb.Image(recent_vis)
+                                })
+                            except:
+                                pass  # Skip if wandb not available
+
+                # Log batch completion
+                if wandb_log:
+                    wandb_log({
+                        "progress/batch_completed": batch_idx + 1,
+                        "progress/total_batches": num_batches,
+                        "progress/batch_progress": (batch_idx + 1) / num_batches * 100
+                    })
 
                 # Memory cleanup after batch
                 torch.cuda.empty_cache()
 
             except Exception as e:
                 print(f"❌ Error processing batch {batch_idx + 1}: {str(e)}")
-                # Skip failed images in batch and continue with next batch
-                for j in range(len(batch_samples)):
-                    progress_bar.update(1)
+                if self.logger:
+                    self.logger.error(f"Batch {batch_idx + 1}: Unexpected batch-level error: {str(e)}")
+                    self.logger.debug(traceback.format_exc())
+
+                # Mark all unprocessed images in batch as failed
+                for data_item in batch_samples_filtered:
+                    if data_item['image_id'] not in processed_images_set:
+                        failed_images.append({
+                            'image_id': data_item['image_id'],
+                            'error': str(e),
+                            'stage': 'batch'
+                        })
+                        progress_bar.update(1)
                 continue
 
         progress_bar.close()
+
+        # Save final checkpoint
+        if self.logger:
+            self.logger.info("Saving final checkpoint...")
+        self.save_checkpoint(
+            list(processed_images_set),
+            all_predictions,
+            detailed_results,
+            processed_count
+        )
 
         # Display processing summary (matching original script format)
         print(f"\n{'='*50}")
         print("PROCESSING COMPLETED")
         print(f"{'='*50}")
         print(f"Total images in dataset: {len(dataset)}")
-        print(f"Successfully processed: {len(all_predictions)}")
-        print(f"Failed/skipped: {len(dataset) - len(all_predictions)}")
-        print(f"Success rate: {len(all_predictions)/len(dataset)*100:.1f}%")
+        print(f"Successfully processed: {processed_count}")
+        print(f"Failed: {len(failed_images)}")
+        print(f"Success rate: {processed_count/len(dataset)*100:.1f}%")
         print(f"{'='*50}")
+
+        if self.logger:
+            self.logger.info(f"Processing completed: {processed_count}/{len(dataset)} images")
+            self.logger.info(f"Failed images: {len(failed_images)}")
+            if failed_images:
+                self.logger.info("Failed images breakdown:")
+                for fail_info in failed_images[:10]:  # Log first 10
+                    self.logger.info(f"  - Image {fail_info['image_id']}: {fail_info['error']} (stage: {fail_info['stage']})")
+                if len(failed_images) > 10:
+                    self.logger.info(f"  ... and {len(failed_images) - 10} more (see failed_images.json)")
+
+        # Save failed images log
+        if failed_images and self.timestamped_output_dir:
+            failed_log = os.path.join(self.timestamped_output_dir, "failed_images.json")
+            with open(failed_log, 'w') as f:
+                json.dump(failed_images, f, indent=2)
+            print(f"💾 Failed images log saved: {failed_log}")
+            if self.logger:
+                self.logger.info(f"Failed images log saved: {failed_log}")
 
         # Final evaluation using official evaluator
         print(f"\n📊 Running final evaluation on {processed_count} processed images...")
@@ -495,8 +797,13 @@ class HOIEvaluationOrchestrator:
 
         # Save comprehensive results
         self.save_comprehensive_results(
-            all_predictions, dataset, console_metrics, detailed_results
+            all_predictions, dataset, console_metrics, detailed_results, failed_images
         )
+
+        if self.logger:
+            self.logger.info("="*60)
+            self.logger.info("EVALUATION COMPLETED SUCCESSFULLY")
+            self.logger.info("="*60)
 
         return {
             'processed_count': processed_count,
@@ -506,20 +813,22 @@ class HOIEvaluationOrchestrator:
             'detailed_results': detailed_results
         }
 
-    def save_comprehensive_results(self, all_predictions, dataset, console_metrics, detailed_results):
+    def save_comprehensive_results(self, all_predictions, dataset, console_metrics, detailed_results, failed_images=None):
         """Save evaluation results to file."""
         # Create results structure
         results = {
             "processing_summary": {
                 "total_images_in_dataset": len(dataset),
-                "successfully_processed": len(all_predictions),
-                "failed_skipped": len(dataset) - len(all_predictions),
-                "success_rate_percent": round((len(all_predictions) / len(dataset)) * 100, 1)
+                "successfully_processed": len(detailed_results),
+                "failed": len(failed_images) if failed_images else 0,
+                "success_rate_percent": round((len(detailed_results) / len(dataset)) * 100, 1) if len(dataset) > 0 else 0
             },
             "evaluation_metrics": console_metrics,
             "successfully_processed_images": detailed_results,
+            "failed_images": failed_images if failed_images else [],
             "timestamp": self.timestamp,  # Include timestamp in results for reference
-            "output_directory": self.timestamped_output_dir
+            "output_directory": self.timestamped_output_dir,
+            "checkpoint_interval": self.checkpoint_interval
         }
 
         # Save results file in timestamped directory
@@ -529,6 +838,8 @@ class HOIEvaluationOrchestrator:
             with open(results_file, 'w') as f:
                 json.dump(results, f, indent=2)
             print(f"✅ Evaluation results saved: {results_file}")
+            if self.logger:
+                self.logger.info(f"Evaluation results saved: {results_file}")
 
 
 def create_orchestrator(args):

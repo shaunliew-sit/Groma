@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple, Union, Dict, Any
 
 from mmcv.ops.nms import nms
 from torchvision.ops import box_iou
+from scipy.optimize import linear_sum_assignment
 from transformers.utils import logging
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.image_transforms import center_to_corners_format
@@ -257,9 +258,10 @@ class GromaModel(PreTrainedModel):
                 for i in range(bs):
                     # merge predicted boxes and user provided (referring) boxes
                     scores_refer = torch.ones(refer_boxes[i].shape[0]).to(scores_fused.device)
-                    # inject ground-truth boxes to predicted boxes, but assign low scores to gt_boxes
-                    # if there exists close predicted boxes, gt boxes will be filter out by NMS
-                    scores_ground = torch.ones(ground_boxes[i].shape[0]).to(scores_fused.device) * 0.2
+                    # inject ground-truth boxes to predicted boxes
+                    # For HOI tasks, use HIGH scores to ensure ground boxes are never filtered by NMS
+                    # (person and object often overlap significantly, e.g., sitting ON, riding, holding)
+                    scores_ground = torch.ones(ground_boxes[i].shape[0]).to(scores_fused.device) * 2.0
                     scores = torch.cat((scores_fused[i], scores_refer, scores_ground))
                     input_boxes = torch.cat((pred_boxes[i], refer_boxes[i], ground_boxes[i]))
                     # filter out redundant and low-quality boxes, select top-k boxes
@@ -287,7 +289,15 @@ class GromaModel(PreTrainedModel):
                         center_to_corners_format(refer_boxes[i]),
                         center_to_corners_format(selected_boxes[i])
                     )
-                    matched_inds = torch.max(ious, dim=-1).indices
+                    # Use Hungarian matching for one-to-one assignment
+                    cost_matrix = -ious.cpu().numpy()  # Negative IoU for minimization
+                    refer_inds, selected_inds = linear_sum_assignment(cost_matrix)
+
+                    # Create matched_inds tensor preserving the order of refer_boxes
+                    matched_inds = torch.zeros(len(refer_boxes[i]), dtype=torch.long, device=ious.device)
+                    for r_idx, s_idx in zip(refer_inds, selected_inds):
+                        matched_inds[r_idx] = s_idx
+
                     refer_box_inds.append(matched_inds)
                     box_idx_token_ids = torch.tensor(self.box_idx_token_ids).to(matched_inds.device)
                     matched_box_idxs = box_idx_token_ids[matched_inds]
@@ -300,7 +310,16 @@ class GromaModel(PreTrainedModel):
                         center_to_corners_format(ground_boxes[i]),
                         center_to_corners_format(selected_boxes[i])
                     )
-                    matched_inds = torch.max(ious, dim=-1).indices
+                    # Use Hungarian matching for one-to-one assignment (critical for HOI!)
+                    # This ensures each ground box matches to a DIFFERENT selected box
+                    cost_matrix = -ious.cpu().numpy()  # Negative IoU for minimization
+                    ground_inds, selected_inds = linear_sum_assignment(cost_matrix)
+
+                    # Create matched_inds tensor preserving the order of ground_boxes
+                    matched_inds = torch.zeros(len(ground_boxes[i]), dtype=torch.long, device=ious.device)
+                    for g_idx, s_idx in zip(ground_inds, selected_inds):
+                        matched_inds[g_idx] = s_idx
+
                     box_idx_token_ids = torch.tensor(self.box_idx_token_ids).to(matched_inds.device)
                     matched_box_idxs = box_idx_token_ids[matched_inds]
                     mask = input_ids[i] == self.ground_box_token_id
