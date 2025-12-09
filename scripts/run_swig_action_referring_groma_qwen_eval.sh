@@ -48,11 +48,11 @@ set -e  # Exit on error
 
 # Configuration with defaults
 GPU_ID="${1:-0}"
-MODEL_PATH="${2:-checkpoints/groma-qwen-stage3-referring-only-24-nov-fixed}"
+MODEL_PATH="${2:-checkpoints/groma-qwen-stage3-lora-v2}"
 SWIG_ROOT="../data/swig_hoi"
 BENCHMARK_ANN="${3:-groma_data/benchmarks/swig_action_referring_test.json}"
 IMAGES_DIR="${4:-${SWIG_ROOT}/images_512}"
-OUTPUT_DIR="${5:-results-redo-groma/swig_action_referring_groma_qwen}"
+OUTPUT_DIR="${5:-results-groma-qwen/swig_action_referring_groma_qwen_lora}"
 
 # Set GPU
 export CUDA_VISIBLE_DEVICES="$GPU_ID"

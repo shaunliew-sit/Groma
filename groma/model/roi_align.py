@@ -1,19 +1,20 @@
-# [GROMA-QWEN] ROI Align module for Groma Qwen3VL
-# Part of: Groma Qwen3VL Referring Task Implementation
+# [GROMA-QWEN V2] ROI Align module for Groma Qwen3VL Native Architecture
+# Part of: Groma Qwen3VL Native Architecture (No DINOv2, No New Tokens)
 #
 # Architecture Overview:
 # ======================
-# This module extracts and fuses multi-level features from DINOv2 for specific regions.
+# This module extracts and fuses multi-level features from Qwen3VL Vision Encoder
+# for specific regions defined by bounding boxes.
 #
 # Components:
 # -----------
 # 1. MLVLFuseModule: Multi-level feature fusion with channel shuffling
-#    - Takes last 3 layers from DINOv2 (different semantic levels)
+#    - Takes features from Qwen3VL vision layers [8, 16, 24] (deepstack_visual_indexes)
 #    - Fuses information across levels via channel shuffling
 #    - Adds 2D coordinate features for spatial awareness
 #
 # 2. MLVLROIQueryModule: Main interface called by GromaQwenModel
-#    - Reshapes DINOv2 sequence features (B, L, D) -> spatial (B, D, H, W)
+#    - Reshapes Qwen3VL sequence features (B, L, D) -> spatial (B, D, H, W)
 #    - Upsamples features to different resolutions for multi-scale ROI
 #    - Applies MLVLFuseModule then MlvlRoIExtractor
 #
@@ -22,24 +23,22 @@
 #    - Adds positional embedding from bounding box coordinates
 #    - Projects to 4096-dim output for LLM embedding space
 #
-# Key Changes for Qwen3VL Compatibility:
-# --------------------------------------
-# - dtype consistency: Ensures bfloat16 compatibility throughout the pipeline
-#   (DINOv2 outputs float32, but Qwen3VL uses bfloat16)
-# - MLVLFuseModule._single_shuffle(): F.interpolate in float32, then convert back
-# - MLVLFuseModule.forward(): coord_feat converted to input dtype
-# - MLVLROIQueryModule.forward(): dtype conversion before/after interpolation
-# - MlvlRoIExtractor.forward(): roi_layers use float32, output converted to expected_dtype
+# Key Dimensions (Qwen3VL):
+# -------------------------
+# - Qwen3VL Vision hidden_states dim: 4096 (post-projection, matches LLM)
+#   Note: The raw vision encoder outputs 1152, but output_hidden_states=True
+#   returns post-projection features at 4096-dim
+# - deepstack_visual_indexes: [8, 16, 24] for multi-level features
+# - Output dimension: 4096 (matches LLM hidden size)
 #
 # Data Flow:
 # ----------
-# DINOv2 features (B, L-1, 1024) x 3 levels
-#   -> Reshape to (B, 1024, H, W)
-#   -> Upsample to multi-scale: 37x37, 74x74, 148x148
+# Qwen3VL vision features (B, L, 4096) x 3 levels [from layers 8, 16, 24]
+#   -> Reshape to (B, 4096, H, W)
+#   -> Upsample to multi-scale for ROI extraction
 #   -> MLVLFuseModule: channel shuffle + coordinate encoding
 #   -> MlvlRoIExtractor: ROI Align (14x14 output) + position embedding
-#   -> Linear projection: 1024 -> 4096
-#   -> Output: (N_regions, 4096) features for VL Bridge
+#   -> Output: (N_regions, 4096) features for Image-to-Text Bridge
 #
 import re
 import math
@@ -51,6 +50,11 @@ import torch.nn.functional as F
 
 from mmcv.cnn import ConvModule, Linear, normal_init
 from mmdet.models import BaseRoIExtractor
+
+# Qwen3VL Vision Encoder hidden size (post-projection from output_hidden_states)
+# Note: Raw vision patch embeddings are 1152, but output_hidden_states returns
+# post-projection features at 4096-dim to match LLM hidden size
+QWEN3VL_VISION_HIDDEN_SIZE = 4096
 
 
 def str2spi(input_str):
@@ -137,7 +141,16 @@ def padding_to(inputs, max=300):
 
 
 class MLVLFuseModule(nn.Module):
-    def __init__(self, input_dims=1024, embed_dims=1024, num_levels=3, num_fuse=4):
+    """Multi-level feature fusion module.
+    
+    Args:
+        input_dims: Input feature dimension (4096 for Qwen3VL post-projection)
+        embed_dims: Embedding dimension for fusion (same as input_dims)
+        num_levels: Number of feature levels (3 for both Qwen3VL and DINOv2)
+        num_fuse: Number of fusion iterations
+    """
+    def __init__(self, input_dims=QWEN3VL_VISION_HIDDEN_SIZE, embed_dims=QWEN3VL_VISION_HIDDEN_SIZE, 
+                 num_levels=3, num_fuse=4):
         super(MLVLFuseModule, self).__init__()
         self.embed_dims = embed_dims
         self.num_levels = num_levels
@@ -244,7 +257,14 @@ class MLVLFuseModule(nn.Module):
 
 
 class MLVLROIQueryModule(nn.Module):
-    def __init__(self, embed_dims=1024, out_dims=4096, num_levels=3):
+    """Multi-level ROI Query Module for extracting region features.
+    
+    Args:
+        embed_dims: Vision feature dimension (4096 for Qwen3VL post-projection)
+        out_dims: Output dimension (4096 to match LLM hidden size)
+        num_levels: Number of feature levels (3)
+    """
+    def __init__(self, embed_dims=QWEN3VL_VISION_HIDDEN_SIZE, out_dims=4096, num_levels=3):
         super(MLVLROIQueryModule, self).__init__()
         self.mlvl_fuse = MLVLFuseModule(
             input_dims=embed_dims,
@@ -262,19 +282,65 @@ class MLVLROIQueryModule(nn.Module):
 
         self.roi_align = MlvlRoIExtractor(**bbox_roi_extractor)
 
-    def forward(self, mlvl_feats, bboxes):
+    def forward(self, mlvl_feats, bboxes, image_grid_thw=None):
+        """Forward pass for extracting region features.
+        
+        Args:
+            mlvl_feats: List of multi-level features, each with shape [L, D] or [B, L, D] or [B, D, H, W]
+            bboxes: List of bounding boxes for each image, normalized to [0, 1]
+            image_grid_thw: Optional tensor with shape [B, 3] containing [T, H, W] grid dimensions
+        """
         # Ensure dtype consistency - convert to match mlvl_fuse module dtype
         expected_dtype = next(self.mlvl_fuse.parameters()).dtype
         mlvl_feats = [f.to(dtype=expected_dtype) for f in mlvl_feats]
         
+        # Handle 2D features [L, D] - add batch dimension
+        if mlvl_feats[0].dim() == 2:
+            mlvl_feats = [f.unsqueeze(0) for f in mlvl_feats]
+        
+        # Reshape from sequence to spatial format if needed
         if mlvl_feats[0].dim() == 3:
-            h = w = int(math.sqrt(mlvl_feats[0].shape[1]))
-            b, c = mlvl_feats[0].shape[0], mlvl_feats[0].shape[-1]
-            mlvl_feats = [item.reshape(b, h, w, c).permute(0, 3, 1, 2) for item in mlvl_feats]
-        base_shape = mlvl_feats[0].shape[-2:]
+            b, seq_len, c = mlvl_feats[0].shape
+            
+            # Try to infer spatial dimensions from sequence length
+            # For Qwen3VL with patch merging, find the best H, W
+            if image_grid_thw is not None:
+                # Use provided grid dimensions (typically half of original due to patch merging)
+                t, h, w = image_grid_thw[0].tolist()
+                # Qwen3VL may have different spatial reduction, try to find matching dims
+                if h * w != seq_len:
+                    # Try halved dimensions (common for 2x2 patch merging)
+                    h, w = h // 2, w // 2
+            else:
+                h, w = None, None
+            
+            # If still no match, find factors closest to square
+            if h is None or h * w != seq_len:
+                # Find best rectangle from sequence length
+                best_h, best_w = 1, seq_len
+                for test_h in range(int(math.sqrt(seq_len)), 0, -1):
+                    if seq_len % test_h == 0:
+                        best_h = test_h
+                        best_w = seq_len // test_h
+                        break
+                h, w = best_h, best_w
+            
+            # Reshape to spatial format [B, C, H, W]
+            if h * w == seq_len:
+                mlvl_feats = [item.reshape(b, h, w, c).permute(0, 3, 1, 2) for item in mlvl_feats]
+            else:
+                # This shouldn't happen if we found valid factors
+                raise ValueError(f"Cannot reshape sequence length {seq_len} to spatial dimensions")
+        
+        # Interpolate all levels to standard sizes for multi-scale ROI
+        # Base size should be 32x32 for MlvlRoIExtractor compatibility
+        target_base_size = 32
         num_level = len(mlvl_feats)
-        to_shape = [(base_shape[0] * 2 ** level, base_shape[1] * 2 ** level) for level in range(num_level)]
-        to_shape = to_shape[::-1]
+        # Create multi-scale targets: 32x32, 64x64, 128x128 for levels 0, 1, 2
+        to_shape = [(target_base_size * 2 ** level, target_base_size * 2 ** level) 
+                    for level in range(num_level)]
+        to_shape = to_shape[::-1]  # Reverse so coarsest level gets largest size
+        
         for level in range(num_level):
             feat = mlvl_feats[level]
             shape = to_shape[level]
@@ -290,11 +356,19 @@ class MLVLROIQueryModule(nn.Module):
 
 
 class MlvlRoIExtractor(BaseRoIExtractor):
+    """Multi-level ROI Extractor with positional encoding.
+    
+    Args:
+        embed_dims: Vision feature dimension (4096 for Qwen3VL post-projection)
+        
+    Note: Internal dimension for positional embedding and fusion is 4096
+    to match the vision feature dimension, then projects to 4096.
+    """
     def __init__(self,
                  roi_layer,
                  out_channels,
                  featmap_strides,
-                 embed_dims=1024,
+                 embed_dims=QWEN3VL_VISION_HIDDEN_SIZE,
                  stride=1,
                  norm_init=True,
                  fuse_level=3,
@@ -310,21 +384,25 @@ class MlvlRoIExtractor(BaseRoIExtractor):
         self.pconvs = nn.ModuleList(
             nn.Conv2d(self.embed_dims, self.embed_dims, 3, stride=1, padding=1)
             for _ in range(self.fuse_level))
+        
+        # Position embedding: bbox (4) -> 256 -> embed_dims (4096)
         self.pos_embedd = nn.Sequential(
             nn.Linear(4, 256),
             nn.ReLU(inplace=True),
             nn.LayerNorm(256),
-            nn.Linear(256, 1024),
+            nn.Linear(256, embed_dims),
             nn.ReLU(inplace=True),
-            nn.LayerNorm(1024),
+            nn.LayerNorm(embed_dims),
         )
-        self.updims = nn.Linear(1024, 4096)
+        
+        # Output projection (identity when embed_dims = 4096, kept for compatibility)
+        self.updims = nn.Linear(embed_dims, 4096)
 
-        self.flatten_linear = nn.Linear(self.embed_dims * self.roi_layers[0].output_size[0] ** 2, 1024)
+        # Flatten ROI features: embed_dims * 14^2 -> embed_dims
+        self.flatten_linear = nn.Linear(self.embed_dims * self.roi_layers[0].output_size[0] ** 2, embed_dims)
 
         self.norm_init_weights()
 
-    #  self.dtype = torch.float32
     def norm_init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):

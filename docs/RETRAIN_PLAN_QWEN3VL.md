@@ -1,1086 +1,680 @@
-# Retrain Groma-Qwen with Qwen3-VL-7B-Instruct Native Chat Template
-
-## Problem Analysis
-
-**Root Cause**: Training uses `conv_llava` template (adds `</s>` as string → token ID 128247) while inference uses Qwen3-VL-7B-Instruct template (expects `<|im_end|>` token ID 151645). This mismatch causes:
-
-- Model learns to generate text token 128247 instead of EOS token 151645
-- Generation never stops because it's looking for the wrong token
-- Training/inference inconsistency
-
-**Solution**: Retrain with Qwen3-VL-7B-Instruct's native chat template to ensure consistency and proper EOS handling.
-
----
-
-## Architecture Summary: Integrating Groma into Qwen3VL
-
-### Overview
-
-The integration of Groma into Qwen3VL follows a **non-invasive, additive approach**. Instead of modifying the base Qwen3VL model, we add Groma-specific components on top of it. This ensures that the original Qwen3VL architecture remains completely untouched, preserving all its capabilities while adding region understanding functionality.
-
-### Key Design Principle: Non-Invasive Integration
-
-The entire integration is built on the principle of **zero modifications** to the base Qwen3VL model. We achieve this through:
-1. **Inheritance**: `GromaQwenModel` inherits from `Qwen3VLForConditionalGeneration` without changing any internal components
-2. **Separate components**: All Groma-specific modules are added as separate, parallel components
-3. **Runtime injection**: Custom embeddings are injected using PyTorch forward hooks, avoiding any permanent modifications
-
-### Architecture Overview Diagram
-
-```mermaid
-graph TB
-    subgraph "GromaQwenModel"
-        subgraph "Qwen3VL Base Model (Untouched)"
-            QwenVision[Qwen3VL Vision Encoder<br/>Full Image Processing]
-            QwenLLM[Qwen3VL LLM<br/>Transformer Layers]
-            QwenEmbed[Qwen3VL Token Embeddings<br/>Original Vocabulary]
-        end
-        
-        subgraph "Groma Components Added"
-            DINOv2[DINOv2 Encoder<br/>Frozen - Region Processing]
-            ROIAlign[ROI Align Module<br/>Multi-Level Fusion]
-            Bridge[Image-to-Text Bridge<br/>4096→4096 Projection]
-            NewEmbed[New Token Embeddings<br/>Groma Tokens]
-            Hook[Forward Hook<br/>Runtime Injection]
-        end
-    end
-    
-    FullImage[Full Image] --> QwenVision
-    RegionImage[Region Images] --> DINOv2
-    BBoxes[Bounding Boxes] --> ROIAlign
-    
-    QwenVision --> QwenLLM
-    DINOv2 --> ROIAlign
-    ROIAlign --> Bridge
-    Bridge --> Hook
-    NewEmbed --> Hook
-    QwenEmbed --> Hook
-    Hook --> QwenLLM
-    
-    QwenLLM --> Output[Generated Text]
-    
-    style QwenVision fill:#e1f5ff
-    style QwenLLM fill:#e1f5ff
-    style QwenEmbed fill:#e1f5ff
-    style DINOv2 fill:#fff4e1
-    style ROIAlign fill:#ffe1f5
-    style Bridge fill:#ffe1f5
-    style NewEmbed fill:#ffe1f5
-    style Hook fill:#e1ffe1
-```
-
-**Legend**:
-- 🔵 **Blue boxes**: Qwen3VL components (untouched)
-- 🟡 **Yellow box**: DINOv2 (frozen, not trained)
-- 🟣 **Pink boxes**: Groma components (trained)
-- 🟢 **Green box**: Hook mechanism (runtime injection)
-
----
-
-## Architectural Components
-
-### Part 1: The Base Model (Qwen3VL - Completely Untouched)
-
-**What it is**: Qwen3VL-7B-Instruct is a powerful vision-language model that can process full images and generate text responses.
-
-**What we keep unchanged**:
-- **Vision Encoder**: Processes full images (`pixel_values`) to extract global image features
-- **Language Model (LLM)**: The transformer-based text generation backbone
-- **Token Embeddings**: Original vocabulary embeddings remain at their original size
-- **All Internal Layers**: Attention mechanisms, feed-forward networks, normalization layers - everything stays exactly as it was
-- **Architecture**: The entire transformer structure, including positional encodings, remains intact
-
-**Why we don't modify it**: 
-- Qwen3VL is a well-trained, production-ready model with excellent vision-language capabilities
-- Modifying it could break existing functionality or degrade performance
-- Keeping it untouched allows us to leverage all its pre-trained knowledge
-
-**How we use it**:
-- Full images are still processed by Qwen3VL's vision encoder
-- Text generation still happens through Qwen3VL's LLM
-- We simply add additional components that work alongside it
-
----
-
-### Part 2: Groma Components Added (New Additions Only)
-
-### Component Architecture Diagram
-
-```mermaid
-graph LR
-    subgraph "Groma Components (Added)"
-        A[DINOv2 Encoder<br/>Frozen<br/>1024-dim] --> B[ROI Align<br/>Multi-Level Fusion<br/>Trained<br/>1024→4096]
-        B --> C[Image-to-Text Bridge<br/>Trained<br/>4096→4096]
-        D[New Token Embeddings<br/>Trained<br/>Groma Tokens] --> E[Forward Hook<br/>Runtime Injection]
-        C --> E
-    end
-    
-    subgraph "Qwen3VL Base (Untouched)"
-        F[Qwen3VL Vision<br/>Full Images] --> G[Qwen3VL LLM]
-        H[Qwen3VL Embeddings<br/>Original Tokens] --> G
-    end
-    
-    E --> G
-    
-    style A fill:#fff4e1,stroke:#ff9800,stroke-width:2px
-    style B fill:#ffe1f5,stroke:#e91e63,stroke-width:2px
-    style C fill:#ffe1f5,stroke:#e91e63,stroke-width:2px
-    style D fill:#ffe1f5,stroke:#e91e63,stroke-width:2px
-    style E fill:#e1ffe1,stroke:#4caf50,stroke-width:2px
-    style F fill:#e1f5ff,stroke:#2196f3,stroke-width:2px
-    style G fill:#e1f5ff,stroke:#2196f3,stroke-width:2px
-    style H fill:#e1f5ff,stroke:#2196f3,stroke-width:2px
-```
-
-**Component Status**:
-- 🟡 **Frozen** (DINOv2): Pre-trained weights, never updated
-- 🟣 **Trained** (ROI Align, Bridge, New Embeddings): Updated during training
-- 🟢 **Runtime** (Hook): Temporary mechanism, no weights
-- 🔵 **Untouched** (Qwen3VL): Original model, never modified
-
-#### Component 1: Region Visual Encoder (DINOv2-Large)
-
-**What it is**: A separate, frozen vision encoder based on DINOv2-Large architecture.
-
-**Purpose**: Extract fine-grained visual features from cropped region images. While Qwen3VL processes full images for global understanding, DINOv2 focuses on detailed region-level features.
-
-**Key characteristics**:
-- **Separate from Qwen3VL**: It's a completely independent module (`self.vis_encoder = Dinov2Model()`)
-- **Frozen**: Set to `requires_grad_(False)`, meaning it's never trained - we use pre-trained DINOv2 weights as-is
-- **Different input**: Only processes cropped region images (`region_images`), NOT full images
-- **Different purpose**: Qwen3VL sees the whole picture; DINOv2 sees the details
-
-**Why DINOv2**:
-- DINOv2 is specifically designed for dense visual feature extraction
-- It provides multi-scale features that are perfect for region understanding
-- Pre-trained on large-scale data, so we can use it directly without training
-
-**How it works**:
-1. Takes cropped region images as input (e.g., a bounding box around a person)
-2. Processes them through DINOv2's transformer layers
-3. Outputs multi-scale feature maps from the last 3 layers
-4. These features capture fine-grained visual details that complement Qwen3VL's global view
-
----
-
-#### Component 2: Region Encoder Head (ROI Align + Multi-Level Fusion)
-
-**What it is**: A module that extracts region-of-interest (ROI) features from DINOv2's multi-scale features using bounding box coordinates.
-
-**Purpose**: Convert DINOv2's patch-level features into region-level features that represent specific bounding boxes.
-
-**Key characteristics**:
-- **Component**: `self.region_encoder = MLVLROIQueryModule()`
-- **Trained**: This component IS trained during Stage 2 and Stage 3
-- **Input**: DINOv2 multi-scale features (from last 3 layers) + bounding box coordinates
-- **Output**: Region features of dimension 4096
-
-**How it works**:
-1. **Multi-Level Feature Fusion**: Takes features from DINOv2's last 3 layers (different scales/resolutions)
-2. **ROI Align**: Uses bounding box coordinates to extract features from specific regions in each scale
-3. **Feature Fusion**: Combines multi-scale features to create rich, scale-invariant region representations
-4. **Dimension Expansion**: Projects from DINOv2's dimension (1024) to LLM dimension (4096)
-
-**Why ROI Align**:
-- ROI Align is a standard technique for extracting features from specific image regions
-- It handles bounding boxes of different sizes and aspect ratios
-- Multi-level fusion ensures we capture both fine details and broader context
-
-**Technical details**:
-- Uses `MlvlRoIExtractor` which performs ROI Align at multiple scales
-- Features from different scales are fused together
-- Final output is 4096-dimensional, matching the LLM's hidden dimension
-
-### ROI Align Process Diagram
-
-```mermaid
-graph TB
-    subgraph "DINOv2 Multi-Scale Features"
-        Layer1[Layer N-2<br/>Coarse Features<br/>Lower Resolution]
-        Layer2[Layer N-1<br/>Medium Features<br/>Medium Resolution]
-        Layer3[Layer N<br/>Fine Features<br/>Higher Resolution]
-    end
-    
-    subgraph "Multi-Level Fusion"
-        Fuse[MLVLFuseModule<br/>Combine Multi-Scale Features<br/>5 Fusion Steps]
-    end
-    
-    subgraph "ROI Align Operation"
-        BBox[Bounding Box<br/>Coordinates<br/>Normalized 0-1]
-        ROIAlign[ROI Align<br/>Extract Region Features<br/>from Each Scale]
-        UpDim[Linear Projection<br/>1024-dim → 4096-dim]
-    end
-    
-    subgraph "Output"
-        RegionFeat[Region Features<br/>4096-dim<br/>Per Bounding Box]
-    end
-    
-    Layer1 --> Fuse
-    Layer2 --> Fuse
-    Layer3 --> Fuse
-    
-    Fuse --> ROIAlign
-    BBox --> ROIAlign
-    
-    ROIAlign --> UpDim
-    UpDim --> RegionFeat
-    
-    style Layer1 fill:#fff4e1
-    style Layer2 fill:#fff4e1
-    style Layer3 fill:#fff4e1
-    style Fuse fill:#ffe1f5
-    style ROIAlign fill:#ffe1f5
-    style UpDim fill:#ffe1f5
-    style RegionFeat fill:#c8e6c9
-```
-
-**Process Flow**:
-1. **Extract Multi-Scale Features**: Get features from DINOv2's last 3 layers (different resolutions)
-2. **Fuse Scales**: Combine features from different scales to capture both fine details and broader context
-3. **ROI Align**: Extract features corresponding to bounding box regions at each scale
-4. **Dimension Expansion**: Project from DINOv2 dimension (1024) to LLM dimension (4096)
-5. **Output**: Region-specific features ready for LLM processing
-
----
-
-#### Component 3: Image-to-Text Bridge
-
-**What it is**: A simple neural network that projects region features into the LLM's embedding space.
-
-**Purpose**: Ensure region features are in the same space as text embeddings so the LLM can process them together.
-
-**Key characteristics**:
-- **Component**: `self.img_txt_bridge = nn.Sequential(Linear(4096→4096), GELU, Linear(4096→4096))`
-- **Trained**: This component IS trained during Stage 2 and Stage 3
-- **Input**: Region features from ROI encoder (4096-dim)
-- **Output**: Projected features (4096-dim) matching LLM embedding dimension
-
-**Why it's needed**:
-- Even though dimensions match (4096), the feature spaces are different
-- Region features come from visual processing; text embeddings come from token processing
-- The bridge learns to align these spaces so the LLM can understand region features as if they were text-like embeddings
-
-**How it works**:
-1. Takes 4096-dimensional region features
-2. Passes through two linear layers with GELU activation
-3. Outputs 4096-dimensional features that are compatible with LLM processing
-
-**Why this architecture**:
-- Simple and effective: two linear layers with activation provide enough flexibility
-- GELU activation is standard in transformer models
-- The projection learns to translate visual features into a format the LLM understands
-
----
-
-#### Component 4: New Token Embeddings
-
-**What it is**: A separate embedding layer for Groma-specific tokens.
-
-**Purpose**: Provide embeddings for special tokens that Groma uses for region understanding (`<region>`, `<r0>` to `<r99>`, `<p>`, `<roi>`, etc.).
-
-**Key characteristics**:
-- **Component**: `self.new_input_embs = nn.Embedding(num_new_token, text_embed_dim)`
-- **Trained**: This component IS trained during Stage 2 and Stage 3
-- **Separate layer**: Does NOT resize or modify Qwen3VL's original embeddings
-- **Initialization**: Initialized as the average of existing Qwen embeddings (smart initialization)
-
-**Why separate embeddings**:
-- Qwen3VL's vocabulary doesn't include Groma-specific tokens
-- We need to add new tokens without disrupting existing ones
-- Keeping them separate ensures we don't accidentally break Qwen3VL's pre-trained token understanding
-
-**How it works**:
-1. New tokens are added to the tokenizer vocabulary (e.g., `<region>`, `<r0>`, `<p>`, `<roi>`)
-2. These tokens get IDs beyond Qwen3VL's original vocabulary size
-3. When these tokens appear in input, we use `new_input_embs` instead of Qwen3VL's embeddings
-4. During training, these embeddings learn to represent Groma-specific concepts
-
-**Why average initialization**:
-- Starting with average Qwen embeddings gives new tokens a reasonable starting point
-- They're not random, so training converges faster
-- They inherit some general language understanding from Qwen3VL
-
----
-
-#### Component 5: Forward Hook Mechanism (Runtime Injection)
-
-**What it is**: A PyTorch forward hook that intercepts the embedding lookup process to inject custom embeddings.
-
-**Purpose**: Inject region features and new token embeddings into the model WITHOUT modifying the base Qwen3VL code.
-
-**Key characteristics**:
-- **Non-invasive**: Uses PyTorch's hook system - no code changes to Qwen3VL
-- **Runtime**: Happens during forward pass, not at model initialization
-- **Temporary**: Hook is registered before forward pass and removed after
-
-**Why hooks instead of direct modification**:
-- Qwen3VL requires `input_ids` for positional encoding (RoPE), but forbids passing both `input_ids` and `inputs_embeds`
-- We need to inject custom embeddings while still using `input_ids` for positional encoding
-- Hooks allow us to intercept and modify embeddings without changing Qwen3VL's code
-
-**How it works**:
-1. **Mask new tokens**: Replace new token IDs with valid Qwen3VL token IDs (e.g., 0) so Qwen3VL's embedding layer doesn't crash
-2. **Register hook**: Attach a forward hook to Qwen3VL's embedding layer
-3. **Hook intercepts**: When Qwen3VL computes embeddings, our hook intercepts the output
-4. **Inject custom embeddings**: 
-   - Replace masked positions with new token embeddings
-   - Replace `<region>` token positions with projected region features
-5. **Remove hook**: Clean up after forward pass
-
-**Technical details**:
-```python
-# Mask new tokens to avoid embedding lookup errors
-masked_input_ids = input_ids.masked_fill(new_token_mask, 0)
-
-# Define hook function
-def embedding_hook(module, inputs, output):
-    # Inject new token embeddings
-    output[new_token_mask] = new_embeds[new_token_mask]
-    # Inject region features at <region> positions
-    output[reg_mask] = region_features_proj
-    return output
-
-# Register hook
-hook_handle = model.get_input_embeddings().register_forward_hook(embedding_hook)
-# Forward pass (hook intercepts embeddings)
-output = super().forward(input_ids=masked_input_ids, ...)
-# Remove hook
-hook_handle.remove()
-```
-
-**Why this approach**:
-- Completely non-invasive: Qwen3VL code never changes
-- Flexible: Can inject different embeddings for different tokens
-- Safe: Hook is temporary, so no permanent modifications
-- Compatible: Works with Qwen3VL's requirements for `input_ids`
-
-### Forward Hook Mechanism Diagram
-
-```mermaid
-sequenceDiagram
-    participant Input as Input IDs<br/>(with new tokens)
-    participant Mask as Token Masking
-    participant QwenEmb as Qwen3VL<br/>Embedding Layer
-    participant Hook as Forward Hook<br/>(Intercepts)
-    participant NewEmb as New Token<br/>Embeddings
-    participant RegionFeat as Region Features
-    participant Output as Combined<br/>Embeddings
-    
-    Input->>Mask: Identify new tokens<br/>(IDs >= vocab_size)
-    Mask->>QwenEmb: masked_input_ids<br/>(new tokens → 0)
-    
-    QwenEmb->>Hook: Compute embeddings<br/>(for masked IDs)
-    
-    Hook->>NewEmb: Lookup new token<br/>embeddings
-    Hook->>RegionFeat: Get region features<br/>(for <region> tokens)
-    
-    NewEmb->>Hook: New token embeddings
-    RegionFeat->>Hook: Region feature embeddings
-    
-    Hook->>Output: Replace embeddings:<br/>- New tokens → New embeddings<br/>- <region> → Region features<br/>- Others → Qwen embeddings
-    
-    Output->>QwenLLM: Unified embedding tensor
-```
-
-**Key Steps**:
-1. **Mask**: New token IDs are replaced with valid IDs (0) to prevent embedding lookup errors
-2. **Intercept**: Hook catches Qwen3VL's embedding output
-3. **Inject**: Hook replaces masked positions with custom embeddings
-4. **Combine**: All embeddings unified into single tensor
-5. **Process**: Combined embeddings passed to Qwen3VL LLM
-
----
-
-## Data Flow: How Everything Works Together
-
-### Complete Data Flow Diagram
-
-```mermaid
-flowchart TD
-    subgraph "Input Stage"
-        FullImg[Full Image<br/>pixel_values]
-        RegionImg[Region Images<br/>region_images]
-        BBoxes[Bounding Boxes<br/>refer_boxes]
-        Text[Text Input<br/>with special tokens]
-    end
-    
-    subgraph "Feature Extraction Stage"
-        QwenVis[Qwen3VL Vision Encoder<br/>Global Image Features]
-        DINO[DINOv2 Encoder<br/>Multi-Scale Features<br/>Last 3 Layers]
-        ROIMod[ROI Align Module<br/>Extract Region Features<br/>1024-dim → 4096-dim]
-        BridgeMod[Image-to-Text Bridge<br/>4096-dim → 4096-dim]
-    end
-    
-    subgraph "Embedding Stage"
-        Tokenizer[Tokenizer<br/>Convert text to IDs]
-        QwenEmb[Qwen3VL Embeddings<br/>Original Tokens]
-        NewEmb[New Token Embeddings<br/>Groma Tokens]
-        HookMech[Forward Hook<br/>Combine & Inject]
-    end
-    
-    subgraph "Processing Stage"
-        QwenLLM[Qwen3VL LLM<br/>Transformer Layers<br/>Process Everything Together]
-    end
-    
-    subgraph "Output Stage"
-        Output[Generated Text<br/>with Region Understanding]
-    end
-    
-    FullImg --> QwenVis
-    RegionImg --> DINO
-    BBoxes --> ROIMod
-    Text --> Tokenizer
-    
-    DINO --> ROIMod
-    ROIMod --> BridgeMod
-    
-    Tokenizer --> QwenEmb
-    Tokenizer --> NewEmb
-    BridgeMod --> HookMech
-    QwenEmb --> HookMech
-    NewEmb --> HookMech
-    QwenVis --> QwenLLM
-    HookMech --> QwenLLM
-    
-    QwenLLM --> Output
-    
-    style FullImg fill:#e3f2fd
-    style RegionImg fill:#e3f2fd
-    style BBoxes fill:#e3f2fd
-    style Text fill:#e3f2fd
-    style QwenVis fill:#e1f5ff
-    style DINO fill:#fff4e1
-    style ROIMod fill:#ffe1f5
-    style BridgeMod fill:#ffe1f5
-    style QwenEmb fill:#e1f5ff
-    style NewEmb fill:#ffe1f5
-    style HookMech fill:#e1ffe1
-    style QwenLLM fill:#e1f5ff
-    style Output fill:#c8e6c9
-```
-
-### Training/Inference Flow
-
-1. **Input Preparation**:
-   - Full image → Qwen3VL's vision encoder (via `pixel_values`)
-   - Cropped region images → DINOv2 encoder (via `region_images`)
-   - Bounding boxes → ROI Align module (via `refer_boxes`)
-   - Text with special tokens → Tokenizer
-
-2. **Feature Extraction**:
-   - Qwen3VL processes full image → Global image features
-   - DINOv2 processes regions → Multi-scale region features
-   - ROI Align extracts features for each bounding box → Region-specific features (4096-dim)
-   - Bridge projects region features → LLM-compatible features (4096-dim)
-
-3. **Embedding Injection**:
-   - Text tokens → Qwen3VL's embedding layer (normal tokens) + New embedding layer (Groma tokens)
-   - Region features → Injected at `<region>` token positions via hook
-   - Everything combined → Unified embedding tensor
-
-4. **LLM Processing**:
-   - Combined embeddings → Qwen3VL's LLM
-   - LLM processes everything together (text + global image + region features)
-   - Output → Generated text with region understanding
-
-### Key Insight: Dual Vision Processing
-
-The architecture uses **two vision encoders for different purposes**:
-- **Qwen3VL Vision Encoder**: Processes full images for global scene understanding
-- **DINOv2 Encoder**: Processes cropped regions for fine-grained region understanding
-
-This dual approach gives the model both:
-- **Global context**: Understanding the whole scene (from Qwen3VL)
-- **Local details**: Understanding specific regions (from DINOv2)
-
-### Dual Vision Processing Diagram
-
-```mermaid
-graph TB
-    subgraph "Input Images"
-        FullImg[Full Image<br/>Complete Scene]
-        RegionCrop[Cropped Region<br/>Bounding Box Area]
-    end
-    
-    subgraph "Vision Encoders"
-        QwenVis[Qwen3VL Vision Encoder<br/>Purpose: Global Understanding<br/>Output: Scene-level Features]
-        DINOVis[DINOv2 Encoder<br/>Purpose: Fine-grained Details<br/>Output: Multi-scale Features<br/>Last 3 Layers]
-    end
-    
-    subgraph "Feature Processing"
-        QwenFeat[Global Image Features<br/>Scene Context]
-        RegionFeat[Region Features<br/>4096-dim<br/>via ROI Align + Bridge]
-    end
-    
-    subgraph "LLM Processing"
-        Combined[Combined Understanding<br/>Global + Local Context]
-    end
-    
-    FullImg --> QwenVis
-    RegionCrop --> DINOVis
-    
-    QwenVis --> QwenFeat
-    DINOVis --> RegionFeat
-    
-    QwenFeat --> Combined
-    RegionFeat --> Combined
-    
-    Combined --> Output[Generated Response<br/>with Region Understanding]
-    
-    style QwenVis fill:#e1f5ff,stroke:#2196f3,stroke-width:2px
-    style DINOVis fill:#fff4e1,stroke:#ff9800,stroke-width:2px
-    style QwenFeat fill:#e1f5ff
-    style RegionFeat fill:#ffe1f5
-    style Combined fill:#c8e6c9
-    style Output fill:#c8e6c9
-```
-
-**Why Two Encoders?**
-- **Complementary Information**: Qwen3VL provides global context, DINOv2 provides local details
-- **Different Optimizations**: Each encoder is optimized for its specific task
-- **Better Understanding**: Combining both gives richer understanding than either alone
-
----
-
-## Why This Architecture?
-
-### Design Decisions Explained
-
-1. **Why keep Qwen3VL untouched?**
-   - Preserves all pre-trained knowledge and capabilities
-   - Avoids breaking existing functionality
-   - Allows leveraging Qwen3VL's excellent vision-language understanding
-
-2. **Why add DINOv2 instead of using Qwen3VL for regions?**
-   - Qwen3VL is optimized for full-image understanding
-   - DINOv2 is specifically designed for dense feature extraction
-   - Using both gives complementary information (global + local)
-
-3. **Why ROI Align?**
-   - Standard technique for region feature extraction
-   - Handles variable-sized bounding boxes
-   - Multi-level fusion captures features at different scales
-
-4. **Why separate token embeddings?**
-   - Doesn't disrupt Qwen3VL's vocabulary
-   - Allows adding new tokens without retraining base model
-   - Keeps Groma-specific tokens isolated
-
-5. **Why forward hooks?**
-   - Only way to inject embeddings while respecting Qwen3VL's `input_ids` requirement
-   - Completely non-invasive
-   - Flexible and safe
-
-### Benefits of This Approach
-
-- **Modularity**: Each component has a clear purpose and can be understood independently
-- **Maintainability**: Changes to Groma components don't affect Qwen3VL
-- **Flexibility**: Can easily add or modify Groma components without touching base model
-- **Safety**: Base model remains stable and reliable
-- **Performance**: Leverages pre-trained models effectively
-
----
-
-## Summary: What Changed and What Didn't
+# Groma-Qwen V2: Native Qwen3VL Architecture
+
+## Overview
+
+Groma-Qwen V2 is a simplified architecture that integrates region-level understanding into Qwen3VL using **only native Qwen3VL components**. This approach eliminates the need for external encoders (DINOv2) and custom tokens, making the model easier to train with limited data.
+
+### Task Formats
+- **Referring Task**: Uses native Qwen3VL bbox tokens (`<|box_start|>`, `<|box_end|>`)
+- **Grounding Task**: Uses JSON format (`{"bbox_2d": [x1, y1, x2, y2], "label": "..."}`) aligned with Qwen3-VL pre-trained capabilities
+
+## Architecture Changes from V1
+
+| Component | V1 (Previous) | V2 (Current) |
+|-----------|---------------|--------------|
+| Vision Encoder | DINOv2 (frozen, 1024-dim) | Qwen3VL Vision (reused, 4096-dim post-projection) |
+| Custom Tokens | `<region>`, `<refer_feat>`, `<r0>`-`<r99>` | None |
+| Bbox Tokens (Referring) | Custom `<roi>`, `<refer_box>` | Native `<\|box_start\|>`, `<\|box_end\|>` |
+| Grounding Output | Custom tokens | JSON format (`{"bbox_2d": [...], "label": "..."}`) |
+| ROI Align | 3-level from DINOv2 layers | 3-level from Qwen3VL layers [8,16,24] |
+| Image-to-Text Bridge | 4096→4096 | 4096→4096 (unchanged) |
+| Forward Hook | Inject at custom tokens | Inject at `<\|box_end\|>` positions |
+| Training | Stage 2 + Stage 3 | Stage 2 only (frozen Qwen3VL) |
+
+### Important: Vision Feature Dimensions
+
+Qwen3VL's vision encoder has two relevant dimensions:
+- **Raw patch embeddings**: 1152-dim (from `vision_config.hidden_size`)
+- **Post-projection hidden states**: 4096-dim (from `output_hidden_states=True`)
+
+The V2 architecture uses **post-projection 4096-dim features** because:
+1. `output_hidden_states=True` returns features already projected to match LLM hidden size
+2. This simplifies the architecture (no dimension mismatch)
+3. Features are already in the LLM's representation space
 
 ### Architecture Comparison Diagram
 
 ```mermaid
 graph TB
-    subgraph "Original Qwen3VL"
-        Q1[Vision Encoder]
-        Q2[LLM]
-        Q3[Token Embeddings]
-        Q4[All Layers]
-        Q1 --> Q2
-        Q3 --> Q2
-    end
-    
-    subgraph "Groma-Qwen Integration"
-        subgraph "Qwen3VL Base (Unchanged)"
-            GQ1[Vision Encoder<br/>✅ Unchanged]
-            GQ2[LLM<br/>✅ Unchanged]
-            GQ3[Token Embeddings<br/>✅ Unchanged]
-            GQ4[All Layers<br/>✅ Unchanged]
+    subgraph V1["V1 Architecture (Previous)"]
+        subgraph V1Qwen["Qwen3VL Base"]
+            V1Vision[Vision Encoder]
+            V1LLM[LLM]
+            V1Embed[Token Embeddings]
         end
         
-        subgraph "Groma Additions"
-            GA1[DINOv2 Encoder<br/>🆕 Added - Frozen]
-            GA2[ROI Align Module<br/>🆕 Added - Trained]
-            GA3[Image-to-Text Bridge<br/>🆕 Added - Trained]
-            GA4[New Token Embeddings<br/>🆕 Added - Trained]
-            GA5[Forward Hook<br/>🆕 Added - Runtime]
+        subgraph V1Groma["Groma Additions"]
+            V1DINO[DINOv2 Encoder<br/>Frozen - 1024-dim]
+            V1ROI[ROI Align]
+            V1Bridge[VL Bridge]
+            V1NewEmbed[New Token Embeddings<br/>region, refer_feat, r0-r99]
+            V1Hook[Forward Hook]
         end
         
-        GA1 --> GA2
-        GA2 --> GA3
-        GA3 --> GA5
-        GA4 --> GA5
-        GQ1 --> GQ2
-        GQ3 --> GA5
-        GA5 --> GQ2
+        V1DINO --> V1ROI
+        V1ROI --> V1Bridge
+        V1Bridge --> V1Hook
+        V1NewEmbed --> V1Hook
+        V1Embed --> V1Hook
+        V1Hook --> V1LLM
     end
     
-    style Q1 fill:#e1f5ff
-    style Q2 fill:#e1f5ff
-    style Q3 fill:#e1f5ff
-    style Q4 fill:#e1f5ff
-    style GQ1 fill:#e1f5ff,stroke:#2196f3,stroke-width:3px
-    style GQ2 fill:#e1f5ff,stroke:#2196f3,stroke-width:3px
-    style GQ3 fill:#e1f5ff,stroke:#2196f3,stroke-width:3px
-    style GQ4 fill:#e1f5ff,stroke:#2196f3,stroke-width:3px
-    style GA1 fill:#fff4e1,stroke:#ff9800,stroke-width:2px
-    style GA2 fill:#ffe1f5,stroke:#e91e63,stroke-width:2px
-    style GA3 fill:#ffe1f5,stroke:#e91e63,stroke-width:2px
-    style GA4 fill:#ffe1f5,stroke:#e91e63,stroke-width:2px
-    style GA5 fill:#e1ffe1,stroke:#4caf50,stroke-width:2px
+    subgraph V2["V2 Architecture (Current)"]
+        subgraph V2Qwen["Qwen3VL Base (Reused)"]
+            V2Vision[Vision Encoder<br/>4096-dim features<br/>post-projection]
+            V2LLM[LLM]
+            V2Embed[Token Embeddings<br/>Native tokens only]
+        end
+        
+        subgraph V2Groma["Groma Additions (Minimal)"]
+            V2ROI[ROI Align<br/>4096→4096]
+            V2Bridge[VL Bridge<br/>4096→4096]
+            V2Hook[Forward Hook<br/>at box_end]
+        end
+        
+        V2Vision --> V2ROI
+        V2ROI --> V2Bridge
+        V2Bridge --> V2Hook
+        V2Embed --> V2Hook
+        V2Hook --> V2LLM
+    end
+    
+    style V1DINO fill:#fff4e1,stroke:#ff9800
+    style V1NewEmbed fill:#ffe1f5,stroke:#e91e63
+    style V1ROI fill:#ffe1f5,stroke:#e91e63
+    style V1Bridge fill:#ffe1f5,stroke:#e91e63
+    style V1Hook fill:#e1ffe1,stroke:#4caf50
+    
+    style V2Vision fill:#e1f5ff,stroke:#2196f3
+    style V2ROI fill:#ffe1f5,stroke:#e91e63
+    style V2Bridge fill:#ffe1f5,stroke:#e91e63
+    style V2Hook fill:#e1ffe1,stroke:#4caf50
 ```
 
-### What We Added (Groma Components):
-1. ✅ DINOv2 region encoder (frozen)
-2. ✅ ROI Align + Multi-level fusion module (trained)
-3. ✅ Image-to-text bridge (trained)
-4. ✅ New token embeddings layer (trained)
-5. ✅ Forward hook mechanism (runtime injection)
+**Key Differences:**
+- V1: Requires DINOv2 encoder (external) + 100+ new tokens
+- V2: Reuses Qwen3VL vision encoder + native tokens only
 
-### What We Kept Unchanged (Qwen3VL):
-1. ✅ Vision encoder for full images
-2. ✅ Language model (LLM)
-3. ✅ Original token embeddings
-4. ✅ All transformer layers
-5. ✅ All attention mechanisms
-6. ✅ All normalization and activation functions
-7. ✅ Positional encodings
-8. ✅ Everything else!
+## Architecture Diagram
 
-### The Result:
-A model that combines:
-- Qwen3VL's powerful vision-language understanding
-- Groma's fine-grained region understanding
-- All working together seamlessly through non-invasive integration
+```mermaid
+flowchart TB
+    subgraph Qwen3VL["Qwen3-VL"]
+        TokenEmbed["Qwen3VL Token Embeddings<br/>Original Vocabulary"]
+        VisionEncoder["Qwen3VL Vision Encoder<br/>Full Image Processing"]
+        LLM["Qwen3VL LLM<br/>Transformer Layer"]
+    end
+    
+    subgraph GromaComponents["Groma V2 Components (Added)"]
+        ROIAlign["ROI Align Module<br/>Multi-level Fusion<br/>4096→4096"]
+        Bridge["Image-to-Text Bridge<br/>4096→4096 projection"]
+        Hook["Forward Hook<br/>Runtime Injection"]
+    end
+    
+    FullImage[Full Image] --> VisionEncoder
+    BBoxes[Bounding Boxes] --> ROIAlign
+    
+    VisionEncoder --> |"Features from<br/>layers [8,16,24]"| ROIAlign
+    ROIAlign --> Bridge
+    Bridge --> Hook
+    TokenEmbed --> Hook
+    Hook --> LLM
+    VisionEncoder --> LLM
+    
+    LLM --> Output[Generated Text]
+    
+    style TokenEmbed fill:#e1f5ff,stroke:#2196f3,stroke-width:2px
+    style VisionEncoder fill:#e1f5ff,stroke:#2196f3,stroke-width:2px
+    style LLM fill:#e1f5ff,stroke:#2196f3,stroke-width:2px
+    style ROIAlign fill:#ffe1f5,stroke:#e91e63,stroke-width:2px
+    style Bridge fill:#ffe1f5,stroke:#e91e63,stroke-width:2px
+    style Hook fill:#e1ffe1,stroke:#4caf50,stroke-width:2px
+```
+
+**Legend:**
+- Blue boxes: Qwen3VL components (frozen/unchanged)
+- Pink boxes: Groma components (trained)
+- Green box: Hook mechanism (runtime injection)
+
+## Native Qwen3VL Tokens
+
+The architecture uses Qwen3VL's built-in bbox tokens:
+
+| Token | ID | Purpose |
+|-------|-----|---------|
+| `<\|object_ref_start\|>` | 151646 | Start of object reference |
+| `<\|object_ref_end\|>` | 151647 | End of object reference |
+| `<\|box_start\|>` | 151648 | Start of bounding box |
+| `<\|box_end\|>` | 151649 | End of bounding box (injection point) |
+
+### Forward Hook Mechanism
+
+```mermaid
+sequenceDiagram
+    participant Input as Input IDs<br/>(with native tokens)
+    participant QwenEmb as Qwen3VL<br/>Embedding Layer
+    participant Hook as Forward Hook<br/>(Intercepts)
+    participant RegionFeat as Region Features<br/>(from ROI Align)
+    participant Output as Combined<br/>Embeddings
+    
+    Input->>QwenEmb: Token IDs including<br/>box_start, box_end
+    
+    QwenEmb->>Hook: Compute embeddings<br/>for all tokens
+    
+    Hook->>Hook: Find box_end<br/>positions
+    Hook->>RegionFeat: Get region features<br/>(4096-dim per region)
+    
+    RegionFeat->>Hook: Projected region<br/>embeddings
+    
+    Hook->>Output: Replace box_end<br/>embeddings with<br/>region features
+    
+    Output->>QwenLLM: Unified embedding<br/>tensor with<br/>injected features
+```
+
+**Key Steps:**
+1. Qwen3VL embedding layer processes all tokens normally
+2. Forward hook intercepts the output embeddings
+3. Hook finds `<|box_end|>` token positions
+4. Hook replaces those embeddings with projected region features
+5. LLM receives embeddings with visual region information injected
+
+## Data Flow
+
+### Referring Task (Action Recognition)
+
+```mermaid
+flowchart LR
+    subgraph Input["Input Stage"]
+        FullImg[Full Image]
+        BBoxes[Bounding Boxes<br/>Person + Object]
+        Text[Text Prompt<br/>with native tokens]
+    end
+    
+    subgraph FeatureExtraction["Feature Extraction"]
+        QwenVis[Qwen3VL Vision<br/>Encoder]
+        MLFeats[Multi-level Features<br/>Layers 8, 16, 24<br/>4096-dim each]
+        ROI[ROI Align<br/>4096→4096]
+        BridgeMod[Image-to-Text<br/>Bridge 4096→4096]
+    end
+    
+    subgraph Injection["Embedding Injection"]
+        TokenEmb[Token Embeddings]
+        HookMech[Forward Hook<br/>at box_end positions]
+    end
+    
+    subgraph Generation["Generation"]
+        QwenLLM[Qwen3VL LLM]
+        Output[Action Phrase<br/>e.g., riding bicycle]
+    end
+    
+    FullImg --> QwenVis
+    QwenVis --> MLFeats
+    BBoxes --> ROI
+    MLFeats --> ROI
+    ROI --> BridgeMod
+    
+    Text --> TokenEmb
+    BridgeMod --> HookMech
+    TokenEmb --> HookMech
+    QwenVis --> QwenLLM
+    HookMech --> QwenLLM
+    
+    QwenLLM --> Output
+    
+    style QwenVis fill:#e1f5ff
+    style QwenLLM fill:#e1f5ff
+    style ROI fill:#ffe1f5
+    style BridgeMod fill:#ffe1f5
+    style HookMech fill:#e1ffe1
+```
+
+### ROI Align Process
+
+```mermaid
+flowchart TB
+    subgraph QwenVision["Qwen3VL Vision Encoder (output_hidden_states=True)"]
+        Layer8[Layer 8 Features<br/>Coarse - 4096-dim]
+        Layer16[Layer 16 Features<br/>Medium - 4096-dim]
+        Layer24[Layer 24 Features<br/>Fine - 4096-dim]
+    end
+    
+    subgraph Reshape["Spatial Reshaping"]
+        SeqToSpatial[Sequence → Spatial<br/>L,D → H,W,D<br/>Variable aspect ratio]
+        Interpolate[Interpolate to<br/>32x32, 64x64, 128x128]
+    end
+    
+    subgraph MLVLFuse["Multi-Level Fusion"]
+        Fuse[MLVLFuseModule<br/>Channel Shuffle + Coord Encoding]
+    end
+    
+    subgraph ROIExtract["ROI Extraction"]
+        BBox[Bounding Box<br/>Coordinates<br/>Normalized 0-1]
+        ROIAlign[ROI Align<br/>14x14 output per region]
+        Flatten[Flatten + Linear<br/>4096 * 196 → 4096]
+        PosEmbed[Position Embedding<br/>bbox → 4096-dim]
+        Add[Add Features]
+    end
+    
+    subgraph Output["Output"]
+        RegionFeat[Region Features<br/>4096-dim per bbox]
+    end
+    
+    Layer8 --> SeqToSpatial
+    Layer16 --> SeqToSpatial
+    Layer24 --> SeqToSpatial
+    SeqToSpatial --> Interpolate
+    Interpolate --> Fuse
+    
+    Fuse --> ROIAlign
+    BBox --> ROIAlign
+    BBox --> PosEmbed
+    
+    ROIAlign --> Flatten
+    Flatten --> Add
+    PosEmbed --> Add
+    Add --> RegionFeat
+    
+    style Layer8 fill:#e1f5ff
+    style Layer16 fill:#e1f5ff
+    style Layer24 fill:#e1f5ff
+    style SeqToSpatial fill:#fff3e0
+    style Interpolate fill:#fff3e0
+    style Fuse fill:#ffe1f5
+    style ROIAlign fill:#ffe1f5
+    style RegionFeat fill:#c8e6c9
+```
+
+**Note on Spatial Reshaping:**
+- Vision hidden states have shape `[L, D]` where L = H × W (variable based on image aspect ratio)
+- Features are reshaped to spatial format and interpolated to standard sizes (32×32, 64×64, 128×128)
+- This ensures consistent processing regardless of input image dimensions
+
+### Prompt Format
+
+#### Referring Task (Action Recognition)
+
+**Input**: Given bounding boxes, predict the action.
+
+```
+<|im_start|>system
+You are an expert at understanding human-object interactions in images. 
+You will be given an image with two regions marked by bounding boxes: 
+one containing a PERSON and one containing an OBJECT. 
+Your task is to describe what ACTION the person is performing with/on/to the object.
+<|im_end|>
+<|im_start|>user
+<|vision_start|><|image_pad|>...<|image_pad|><|vision_end|>
+Action Recognition Task: The first region <|object_ref_start|>person<|object_ref_end|><|box_start|>(323,66),(665,622)<|box_end|> contains a PERSON. The second region <|object_ref_start|>object<|object_ref_end|><|box_start|>(90,202),(892,841)<|box_end|> contains an OBJECT. Describe the action the person is performing with this object. Respond with only the action phrase (e.g., "riding bicycle", "sitting on bench").
+<|im_end|>
+<|im_start|>assistant
+```
+
+**Output Format** (Generated by model):
+```
+racing motorcycle
+```
+
+**Notes:**
+- Bounding box coordinates are in `[0, 1000]` range (Qwen3VL standard)
+- The `<|box_end|>` token position is where region features are injected
+- Model generates only the action phrase (no bounding boxes in output)
 
 ---
 
-## Implementation Plan
+#### Grounding Task (Object Localization) - JSON Format
 
-### ⚠️ CRITICAL FIRST STEP: Regenerate Training Datasets with Qwen3VL Template Format
+**Input**: Given action + object description, predict bounding boxes for ALL matching pairs in JSON format.
 
-**MUST BE COMPLETED BEFORE ANY CODE CHANGES**
+> **Note**: The grounding task uses JSON format (`{"bbox_2d": [...], "label": "..."}`) which aligns with 
+> Qwen3-VL's pre-trained grounding capabilities. This provides better accuracy than custom token formats.
 
-**New Script: `Groma/scripts/regenerate_datasets_qwen3vl.py`**
+> **Important**: Labels use simplified format to avoid confusion:
+> - Person entries: `"label": "person"` (simple, unambiguous)
+> - Object entries: `"label": "{object_category}"` (e.g., "bench", "motorcycle")
+> 
+> This prevents the model from confusing person vs object entries and ensures proper alternating order.
 
-1. **Analyze current dataset format**:
+```
+<|im_start|>system
+You are an expert at locating human-object interactions in images. 
+When asked to locate people performing actions with objects, find ALL matching 
+person-object pairs and output their bounding box coordinates in JSON format. 
+Use bbox_2d as [x1, y1, x2, y2] coordinates (0-1000 scale). 
+Label person boxes as 'person' and object boxes with the object category name. 
+Output pairs in alternating order: [person, object, person, object, ...].
+<|im_end|>
+<|im_start|>user
+<|vision_start|><|image_pad|>...<|image_pad|><|vision_end|>
+Locate every person who is racing motorcycle and the motorcycle they interact with in this image. For each person-object pair, output bbox coordinates in JSON format like: {"bbox_2d": [x1, y1, x2, y2], "label": "description"}
+<|im_end|>
+<|im_start|>assistant
+```
 
-   - Read `Groma/groma_data/benchmarks/hico_qwen_v3.json` (162,445 samples)
-   - Read `Groma/groma_data/benchmarks/swig_qwen_v3.json` (120,312 samples)
-   - Current format: `{"from": "human"/"gpt", "value": "...", "box_inds": [...]}`
-   - Understand conversation structure and metadata (boxes, action, object_category, etc.)
-
-2. **Load Qwen3-VL-8B-Instruct tokenizer and processor from local checkpoint**:
-
-   - Load tokenizer from `Groma/checkpoints/Qwen3-VL-8B-Instruct` (local checkpoint)
-   - Load processor from `Groma/checkpoints/Qwen3-VL-8B-Instruct` (local checkpoint)
-   - **CRITICAL**: Use Qwen3-VL (NOT Qwen2-VL) - verify model name contains "Qwen3-VL"
-   - Verify `apply_chat_template()` method is available
-   - Understand Qwen3-VL-8B-Instruct message format requirements
-   - Example loading:
-     ```python
-     from transformers import AutoTokenizer, AutoProcessor
-     
-     checkpoint_path = "Groma/checkpoints/Qwen3-VL-8B-Instruct"
-     tokenizer = AutoTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
-     processor = AutoProcessor.from_pretrained(checkpoint_path, trust_remote_code=True)
-     ```
-
-3. **Convert conversations to Qwen3-VL-8B-Instruct message format**:
-
-   - Transform `{"from": "human", "value": "..."}` → `{"role": "user", "content": [...]}`
-   - Transform `{"from": "gpt", "value": "..."}` → `{"role": "assistant", "content": "..."}`
-   - Add system message: `{"role": "system", "content": "Here is an image with region crops from it. Image: <image>. Regions: <region>."}`
-   - For user messages with images: `{"role": "user", "content": [{"type": "image", "image": "placeholder"}, {"type": "text", "text": "[grounding] Identify..."}]}`
-   - Preserve all Groma tokens (`<p>`, `<roi>`, coordinates like `(x1,y1),(x2,y2)`, etc.)
-   - Keep all metadata: boxes, box_inds, action, object_category, width, height, file_name
-
-4. **Validate Qwen3-VL-8B-Instruct template format**:
-
-   - Use `tokenizer.apply_chat_template(messages, tokenize=False)` to verify format
-   - Ensure `<|im_start|>` and `<|im_end|>` tokens are added correctly
-   - Verify EOS token ID 151645 (`<|im_end|>`) appears at end of assistant responses
-   - Test with a few sample conversations
-   - **Verify**: Template format matches Qwen3-VL (not Qwen2-VL) - check for Qwen3-VL specific tokens
-
-5. **Generate new dataset files**:
-
-   - Option A: Create new files `hico_qwen_v3_qwen3vl.json` and `swig_qwen_v3_qwen3vl.json`
-   - Option B: Overwrite existing files (backup first)
-   - Preserve JSON structure: array of objects with all original fields
-   - Add new field `messages` with Qwen3-VL-8B-Instruct format (or replace `conversation` field)
-   - Ensure no data loss: same number of samples, boxes, metadata
-
-6. **Validation checks**:
-
-   - Verify dataset structure matches expected format
-   - Check that all conversations are properly formatted
-   - Ensure no data loss (same number of samples, boxes, etc.)
-   - Test tokenization: verify EOS tokens (151645) are added correctly
-   - Compare tokenized output: old format vs new format (should have `<|im_end|>` instead of `</s>`)
-   - **Verify**: Tokenizer is from Qwen3-VL (check tokenizer config/model name)
-
-### Phase 2: Create Qwen3-VL-8B-Instruct-Compatible Dataset Processor
-
-**File: `Groma/groma/data/datasets/groma_qwen.py`**
-
-1. **Replace `conv_llava` template with Qwen3-VL-8B-Instruct message format**:
-
-   - Remove dependency on `conv_templates['llava']` and `get_prompt()` method
-   - Load Qwen3-VL-8B-Instruct processor/tokenizer from `Groma/checkpoints/Qwen3-VL-8B-Instruct` with `apply_chat_template()` method
-   - **CRITICAL**: Use Qwen3-VL (NOT Qwen2-VL) - load from local checkpoint path
-   - Convert conversation format to Qwen3-VL-8B-Instruct message structure in `preprocess()` method
-   - Use `tokenizer.apply_chat_template(messages, tokenize=True)` instead of manual prompt construction
-   - This automatically handles `<|im_start|>` and `<|im_end|>` tokens correctly
-
-2. **Preserve Groma-specific tokens**:
-
-   - Ensure `<p>`, `<roi>`, `<region>`, etc. are added to tokenizer vocabulary
-   - These tokens work alongside Qwen3-VL-8B-Instruct template tokens
-
-3. **Handle image and region inputs**:
-
-   - Qwen3VL template supports multi-modal content (image + text)
-   - Region features need to be injected at `<region>` token positions
-   - Maintain compatibility with existing ROI Align pipeline
-
-4. **Update target masking logic**:
-
-   - Ensure labels are properly masked (only assistant responses are trained)
-   - EOS token (151645) should be included in targets for training
-
-### Phase 3: Update Dataset Configuration
-
-**File: `Groma/groma/data/configs/vl_finetune_hoi_combined_qwen.py`**
-
-1. **Update dataset paths**:
-
-   - Point to regenerated datasets (`hico_qwen_v3_qwen3vl.json` and `swig_qwen_v3_qwen3vl.json`)
-   - Or verify existing paths work if overwritten
-
-2. **Remove `conv_temp` parameter**:
-
-   - Remove `'conv_temp': 'llava'` (no longer needed with Qwen3VL template)
-   - Dataset processor will use Qwen3VL template directly
-
-### Phase 4: Verify Training Script Compatibility
-
-**File: `Groma/groma/train/train_qwen.py`**
-
-1. **Ensure tokenizer setup**:
-
-   - Qwen3VL tokenizer is loaded correctly from `Groma/checkpoints/Qwen3-VL-8B-Instruct`
-   - **CRITICAL**: Verify it's Qwen3-VL (not Qwen2-VL) - check model name/config
-   - Groma special tokens are added to vocabulary
-   - Tokenizer has `apply_chat_template` method available
-
-2. **Verify EOS token handling**:
-
-   - Training should use `eos_token_id=151645` (`<|im_end|>`)
-   - Loss computation should include EOS token in targets
-
-### Phase 5: Update Inference Script
-
-**File: `Groma/scripts/run_groma_qwen.py`**
-
-1. **Clean up debug code**
-2. **Verify EOS token handling**:
-
-   - Qwen3VL's `apply_chat_template` already adds `<|im_end|>` correctly
-   - Ensure `eos_token_id=151645` is used in generation
-   - Verify generation stops correctly at EOS token
-   - **Ensure**: Tokenizer/processor loaded from `Groma/checkpoints/Qwen3-VL-8B-Instruct` (Qwen3-VL, not Qwen2-VL)
-
-### Phase 6: Testing & Validation
-
-1. **Test dataset preprocessing**: Verify Qwen3VL message format and EOS tokens (151645)
-2. **Test training**: Run Stage 2 and Stage 3 with new template, verify loss decreases
-3. **Test inference**: Verify generation stops correctly and Groma tokens work
-4. **Verify model identity**: Confirm all components use Qwen3-VL (not Qwen2-VL) throughout pipeline
-
-## Key Implementation Details
-
-### Qwen3VL Message Format
-
-```python
-messages = [
-    {
-        "role": "system",
-        "content": "Here is an image with region crops from it. Image: <image>. Regions: <region>."
-    },
-    {
-        "role": "user",
-        "content": [
-            {"type": "image", "image": PIL.Image},
-            {"type": "text", "text": "[grounding] Identify the following..."}
-        ]
-    },
-    {
-        "role": "assistant",
-        "content": "<p> person </p> <roi> (x1,y1),(x2,y2) </roi> ..."
-    }
+**Output Format** (Generated by model - JSON array with simplified labels):
+```json
+[
+  {"bbox_2d": [323, 66, 665, 622], "label": "person"},
+  {"bbox_2d": [90, 202, 892, 841], "label": "motorcycle"}
 ]
 ```
 
-### Tokenization Flow
+**Notes:**
+- Output is a JSON array with all person-object pairs
+- Pairs are ordered sequentially: [person1, object1, person2, object2, ...]
+- Labels use simplified format: `"person"` for persons, object category name for objects
+- This prevents label confusion and ensures reliable multi-pair detection
+- Coordinates are in `[0, 1000]` range
+- Same object may appear multiple times if multiple people interact with it
 
-1. Convert conversations to Qwen3VL message format
-2. Use `tokenizer.apply_chat_template(messages, tokenize=True)` 
-3. Template automatically adds `<|im_end|>` (EOS token ID 151645) at end of assistant responses
+---
 
-### Model Loading (Qwen3-VL, NOT Qwen2-VL)
+### Complete Prompt Examples
 
-**CRITICAL**: Always load from local checkpoint to ensure Qwen3-VL:
+#### Example 1: Referring Task (HICO-DET)
 
-```python
-from transformers import AutoTokenizer, AutoProcessor, Qwen3VLForConditionalGeneration
+**Image**: Person racing a motorcycle  
+**Person bbox**: `[207, 32, 426, 299]` (pixels) → `(323, 66), (665, 622)` (Qwen format)  
+**Object bbox**: `[58, 97, 571, 404]` (pixels) → `(90, 202), (892, 841)` (Qwen format)
 
-checkpoint_path = "Groma/checkpoints/Qwen3-VL-8B-Instruct"
-
-# Load tokenizer and processor
-tokenizer = AutoTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
-processor = AutoProcessor.from_pretrained(checkpoint_path, trust_remote_code=True)
-
-# Verify it's Qwen3-VL (not Qwen2-VL)
-assert "Qwen3-VL" in tokenizer.name_or_path or "qwen3" in tokenizer.name_or_path.lower()
+**Full Prompt (as sent to tokenizer)**:
+```
+<|im_start|>system
+You are an expert at understanding human-object interactions in images. You will be given an image with two regions marked by bounding boxes: one containing a PERSON and one containing an OBJECT. Your task is to describe what ACTION the person is performing with/on/to the object.
+<|im_end|>
+<|im_start|>user
+<|vision_start|><|image_pad|><|vision_end|>
+Action Recognition Task: The first region <|object_ref_start|>person<|object_ref_end|><|box_start|>(323,66),(665,622)<|box_end|> contains a PERSON. The second region <|object_ref_start|>object<|object_ref_end|><|box_start|>(90,202),(892,841)<|box_end|> contains an OBJECT. Describe the action the person is performing with this object. Respond with only the action phrase (e.g., "riding bicycle", "sitting on bench").
+<|im_end|>
+<|im_start|>assistant
+racing motorcycle<|im_end|>
 ```
 
-## Files to Modify
+#### Example 2: Grounding Task (HICO-DET) - JSON Format with Simplified Labels
 
-1. **`Groma/scripts/regenerate_datasets_qwen3vl.py`** (NEW): Script to regenerate datasets with Qwen3VL template format - **MUST RUN FIRST**
-   - Load tokenizer/processor from `Groma/checkpoints/Qwen3-VL-8B-Instruct`
-   - Verify Qwen3-VL (not Qwen2-VL)
-2. **`Groma/groma/data/datasets/groma_qwen.py`**: Rewrite `preprocess()` to use Qwen3VL template
-   - Load from `Groma/checkpoints/Qwen3-VL-8B-Instruct`
-   - Verify Qwen3-VL (not Qwen2-VL)
-3. **`Groma/groma/data/configs/vl_finetune_hoi_combined_qwen.py`**: Update dataset paths and remove conv_temp parameter
-4. **`Groma/groma/train/train_qwen.py`**: Ensure tokenizer loaded from `Groma/checkpoints/Qwen3-VL-8B-Instruct`
-   - Verify Qwen3-VL (not Qwen2-VL)
-5. **`Groma/scripts/run_groma_qwen.py`**: Clean up debug code, ensure Qwen3-VL checkpoint path
+**Image**: Person racing a motorcycle  
+**Action**: "racing"  
+**Object**: "motorcycle"
 
-## Success Criteria
-
-1. ✅ Datasets regenerated with Qwen3VL message format (CRITICAL FIRST STEP)
-2. Training uses Qwen3VL native chat template from `Groma/checkpoints/Qwen3-VL-8B-Instruct`
-3. EOS token ID (151645) is properly added during training
-4. Groma-specific tokens work correctly
-5. Model learns to generate EOS token (151645)
-6. Inference stops correctly at `<|im_end|>` token
-7. Training and inference use consistent template format
-8. Qwen3VL base architecture remains completely untouched
-9. Groma components work seamlessly via hook mechanism
-10. **All components verified to use Qwen3-VL (NOT Qwen2-VL) throughout the pipeline**
-
----
-
-## Latest Updates: Grounding Task Fixes (2024)
-
-### Problem Identified: Training/Inference Mismatch for Grounding Tasks
-
-**Issue**: Grounding task performance was worse than default Qwen3VL, with incorrect coordinate generation.
-
-**Root Cause**: 
-- **Training**: Dataset created `region_images = torch.empty(0, 3, 224, 224)` (empty tensor, not None) for grounding tasks
-- **Inference**: Script passed `region_images = None` (None value)
-- **Mismatch**: Model saw different inputs during training vs inference, causing incorrect behavior
-
-### Fixes Applied
-
-#### Fix 1: Dataset Returns None for Empty Refer Boxes
-**File**: `groma/data/datasets/groma_qwen.py` (Lines 331-338)
-
-**Change**:
-```python
-# Before:
-region_images = torch.empty(0, 3, 224, 224)  # Empty tensor
-
-# After:
-region_images = None  # None value (matches inference)
+**Full Prompt (as sent to tokenizer)**:
+```
+<|im_start|>system
+You are an expert at locating human-object interactions in images. When asked to locate people performing actions with objects, find ALL matching person-object pairs and output their bounding box coordinates in JSON format. Use bbox_2d as [x1, y1, x2, y2] coordinates (0-1000 scale). Label person boxes as 'person' and object boxes with the object category name. Output pairs in alternating order: [person, object, person, object, ...].
+<|im_end|>
+<|im_start|>user
+<|vision_start|><|image_pad|><|vision_end|>
+Locate every person who is racing motorcycle and the motorcycle they interact with in this image. For each person-object pair, output bbox coordinates in JSON format like: {"bbox_2d": [x1, y1, x2, y2], "label": "description"}
+<|im_end|>
+<|im_start|>assistant
+[{"bbox_2d": [323, 66, 665, 622], "label": "person"}, {"bbox_2d": [90, 202, 892, 841], "label": "motorcycle"}]<|im_end|>
 ```
 
-**Effect**: Training now matches inference - both use `None` when no `refer_boxes` are present.
+#### Example 3: Multi-Pair Grounding (Multiple people doing same action) - JSON Format with Simplified Labels
 
-#### Fix 2: Model Checks for Empty Tensors
-**File**: `groma/model/groma_qwen.py` (Lines 192-200)
+**Image**: Two people sitting on a bench  
+**Action**: "sitting on"  
+**Object**: "bench"
 
-**Change**:
-```python
-# Before:
-if region_images is not None and refer_boxes is not None:
-
-# After:
-has_regions = (
-    region_images is not None 
-    and refer_boxes is not None
-    and (isinstance(region_images, torch.Tensor) and region_images.shape[0] > 0)
-    and (isinstance(refer_boxes, list) and len(refer_boxes) > 0 and refer_boxes[0].shape[0] > 0)
-)
-
-if has_regions:
+**Full Prompt**:
+```
+<|im_start|>system
+You are an expert at locating human-object interactions in images. When asked to locate people performing actions with objects, find ALL matching person-object pairs and output their bounding box coordinates in JSON format. Use bbox_2d as [x1, y1, x2, y2] coordinates (0-1000 scale). Label person boxes as 'person' and object boxes with the object category name. Output pairs in alternating order: [person, object, person, object, ...].
+<|im_end|>
+<|im_start|>user
+<|vision_start|><|image_pad|><|vision_end|>
+Locate every person who is sitting on bench and the bench they interact with in this image. For each person-object pair, output bbox coordinates in JSON format like: {"bbox_2d": [x1, y1, x2, y2], "label": "description"}
+<|im_end|>
+<|im_start|>assistant
+[{"bbox_2d": [320, 306, 359, 349], "label": "person"}, {"bbox_2d": [148, 345, 376, 414], "label": "bench"}, {"bbox_2d": [270, 303, 311, 350], "label": "person"}, {"bbox_2d": [148, 345, 376, 414], "label": "bench"}]<|im_end|>
 ```
 
-**Effect**: Defensive check prevents processing empty regions, ensuring grounding tasks skip region processing correctly.
+**Note**: Each person-object pair is output sequentially in JSON array format. The same object (bench) may appear multiple times if multiple people interact with it.
 
 ---
 
-## Current Training and Inference Flow
+### Coordinate Conversion
 
-### Grounding Task Flow
+Qwen3VL uses coordinates in `[0, 1000]` range. Here's how to convert:
 
-**Task**: Given text description → Output bounding box coordinates  
-**Example**: "person sitting on bench" → `(320,306),(359,349)`
+```python
+def pixel_to_qwen(bbox_pixel, img_size):
+    """Convert pixel coordinates to Qwen3VL [0, 1000] format.
+    
+    Args:
+        bbox_pixel: [x1, y1, x2, y2] in pixel coordinates
+        img_size: (width, height) of image
+    
+    Returns:
+        [x1, y1, x2, y2] in [0, 1000] range
+    """
+    w, h = img_size
+    x1, y1, x2, y2 = bbox_pixel
+    return [
+        int(x1 / w * 1000),
+        int(y1 / h * 1000),
+        int(x2 / w * 1000),
+        int(y2 / h * 1000)
+    ]
 
-#### Training Flow:
-1. **Input**: Full image + text query `"[grounding] Identify the following person and objects in the image: person sitting on bench and the bench"`
-2. **Dataset Processing** (`groma/data/datasets/groma_qwen.py`):
-   - Extracts `refer_boxes` from conversation → Empty for grounding (`torch.empty(0, 4)`)
-   - Prepares `region_images` → Returns `None` (FIXED: was empty tensor)
-   - Extracts `ground_boxes` → Actual boxes (training target)
-3. **Model Forward** (`groma/model/groma_qwen.py`):
-   - Checks `has_regions` → `False` (both are `None`)
-   - **Skips**: Region processing (DINOv2 + Region Encoder + VL Bridge)
-   - **Uses**: Qwen3VL vision encoder processes full image (`pixel_values`)
-   - Processes text through Qwen3VL LLM
-   - **Output**: Generates coordinates in text format (e.g., `(x1,y1),(x2,y2)`)
+def qwen_to_pixel(bbox_qwen, img_size):
+    """Convert Qwen3VL [0, 1000] format to pixel coordinates.
+    
+    Args:
+        bbox_qwen: [x1, y1, x2, y2] in [0, 1000] range
+        img_size: (width, height) of image
+    
+    Returns:
+        [x1, y1, x2, y2] in pixel coordinates
+    """
+    w, h = img_size
+    x1, y1, x2, y2 = bbox_qwen
+    return [
+        x1 / 1000 * w,
+        y1 / 1000 * h,
+        x2 / 1000 * w,
+        y2 / 1000 * h
+    ]
 
-#### Inference Flow:
-1. **Input**: Full image + text query `"[grounding] Identify..."`
-2. **Script** (`scripts/run_groma_qwen.py`):
-   - Does NOT pass `region_images` (remains `None`)
-   - Does NOT pass `refer_boxes` (remains `None`)
-   - Passes full image via `pixel_values`
-3. **Model Forward**:
-   - Checks `has_regions` → `False` (both are `None`)
-   - **Skips**: Region processing
-   - **Uses**: Qwen3VL vision encoder processes full image
-   - Processes text through Qwen3VL LLM
-   - **Output**: Generates coordinates in text format
+# Example:
+# Image size: 640 x 480
+# Pixel bbox: [207, 32, 426, 299]
+# Qwen bbox:  (323, 66), (665, 622)
+```
 
-**✓ Training and Inference MATCH**: Both use `None` for `region_images` and `refer_boxes`, both skip region processing, both use Qwen3VL vision encoder for full image.
+### Token ID Reference
 
-### Referring Task Flow
+| Token | ID | Description |
+|-------|-----|-------------|
+| `<\|im_start\|>` | 151644 | Message start |
+| `<\|im_end\|>` | 151645 | Message end / EOS |
+| `<\|object_ref_start\|>` | 151646 | Object label start |
+| `<\|object_ref_end\|>` | 151647 | Object label end |
+| `<\|box_start\|>` | 151648 | Bounding box start |
+| `<\|box_end\|>` | 151649 | Bounding box end (injection point) |
+| `<\|vision_start\|>` | 151652 | Vision content start |
+| `<\|vision_end\|>` | 151653 | Vision content end |
+| `<\|image_pad\|>` | 151655 | Image token placeholder |
 
-**Task**: Given bounding boxes → Output action description  
-**Example**: `[320,306,359,349]` + `[148,345,376,414]` → `"sitting on bench"`
+## Training Configuration
 
-#### Training Flow:
-1. **Input**: Full image + text query with `<refer_feat>` tokens
-   - Query: `"What is <roi><refer_box>500,716,560,817</refer_box></roi><refer_feat> doing with <roi><refer_box>231,807,587,969</refer_box></roi><refer_feat>?"`
-2. **Dataset Processing**:
-   - Extracts `refer_boxes` from user query → Actual boxes (`torch.tensor(N, 4)`)
-   - Prepares `region_images` → Crops regions and returns `tensor(N, 3, 224, 224)` (FIXED: now properly crops)
-   - Extracts `ground_boxes` → Actual boxes (training target)
-3. **Model Forward**:
-   - Checks `has_regions` → `True` (has regions)
-   - **Processes**: 
-     - DINOv2 extracts features from cropped regions
-     - Region Encoder processes features with bounding box info
-     - VL Bridge projects to LLM dimension
-   - **Injects**: Features at `<refer_feat>` token positions (FIXED: now properly injects)
-   - **Uses**: Qwen3VL vision encoder (full image) + region features (injected)
-   - **Output**: Generates action text (e.g., `"sitting on bench"`)
+### Stage 2 Only (Recommended)
 
-#### Inference Flow:
-1. **Input**: Full image + bounding boxes + text query
-2. **Script** (`scripts/test_groma_qwen_referring.py`):
-   - Crops regions from image based on bounding boxes
-   - Passes `region_images = tensor(N, 3, 224, 224)`
-   - Passes `refer_boxes = [tensor(N, 4)]`
-3. **Model Forward**:
-   - Checks `has_regions` → `True` (has regions)
-   - **Processes**: DINOv2 → Region Encoder → VL Bridge
-   - **Injects**: Features at `<refer_feat>` token positions
-   - **Uses**: Qwen3VL vision encoder (full image) + region features
-   - **Output**: Generates action text
+| Component | Status |
+|-----------|--------|
+| Qwen3VL LLM | Frozen |
+| Qwen3VL Vision Encoder | Frozen (features extracted) |
+| ROI Align Module | **Trained** |
+| Image-to-Text Bridge | **Trained** |
 
-**✓ Training and Inference MATCH**: Both use regions, both process regions, both inject features at `<refer_feat>` positions.
+### Training Parameters
 
----
+```bash
+# Referring-only training
+TASK_TYPE=referring deepspeed --num_gpus=8 \
+    -m groma.train.train_qwen \
+    --llm checkpoints/Qwen3-VL-8B-Instruct \
+    --output_dir checkpoints/groma-qwen-v2-stage2-referring \
+    --dataset_config groma/data/configs/vl_train_stage2_qwen3vl_native.py \
+    --freeze_llm True \
+    --per_device_train_batch_size 4 \
+    --gradient_accumulation_steps 4 \
+    --num_train_epochs 4 \
+    --learning_rate 2e-4 \
+    --warmup_ratio 0.03 \
+    --bf16 True \
+    --deepspeed scripts/zero2.json
 
-## Training Process Overview
+# Combined training (referring + grounding)
+TASK_TYPE=both deepspeed --num_gpus=8 \
+    -m groma.train.train_qwen \
+    ...
+```
 
-### Stage 2: VL Alignment Pretraining
+### Dataset Options
 
-**Purpose**: Train VL Bridge and Region Encoder to extract and project region features
+Set `TASK_TYPE` environment variable:
+- `referring` - Train on referring task only (153,834 samples)
+- `grounding` - Train on grounding task only (128,923 samples)
+- `both` - Train on both tasks (282,757 samples)
 
-**Configuration**: `groma/data/configs/vl_pretrain_hoi_combined.py`
+## Dataset Statistics
 
-**Datasets**:
-- HICO-DET Combined (grounding + referring): 162,445 samples
-- SWIG-HOI Combined (grounding + referring): 120,312 samples
-- Total: 282,757 samples
+| Dataset | Referring | Grounding | Total |
+|---------|-----------|-----------|-------|
+| HICO-DET | 93,041 | 69,404 | 162,445 |
+| SWIG-HOI | 60,793 | 59,519 | 120,312 |
+| **Total** | **153,834** | **128,923** | **282,757** |
 
-**Training Setup**:
-- **Freeze**: LLM (Qwen3VL), Perceiver (DINOv2)
-- **Train**: VL Bridge, Region Encoder, New Token Embeddings
-- **Epochs**: 4
-- **Batch Size**: 2 per device × 8 GPUs × 4 gradient accumulation = 64 effective
+## Files Structure
 
-**Data Flow**:
-- **Grounding samples**: `region_images=None`, `refer_boxes=None` → Skip region processing, use full image
-- **Referring samples**: `region_images=tensor(N,3,224,224)`, `refer_boxes=[tensor(N,4)]` → Process regions, inject at `<refer_feat>`
+```
+Groma/
+├── groma/
+│   ├── model/
+│   │   ├── groma_qwen.py        # V2 model (native architecture)
+│   │   └── roi_align.py         # ROI Align (4096-dim for Qwen3VL post-projection)
+│   ├── data/
+│   │   ├── datasets/
+│   │   │   └── groma_qwen.py    # Dataset processor (native format)
+│   │   └── configs/
+│   │       └── vl_train_stage2_qwen3vl_native.py  # Training config
+│   ├── train/
+│   │   └── train_qwen.py        # Training script (simplified)
+│   └── eval/
+│       └── eval_hico_action_referring_groma_qwen_v2.py  # Evaluation
+├── scripts/
+│   ├── regenerate_datasets_qwen3vl_native.py  # Dataset regeneration
+│   └── test_groma_qwen_referring.py           # Inference test
+└── groma_data/
+    └── benchmarks/
+        ├── hico_referring_qwen3vl_native.json
+        ├── hico_combined_qwen3vl_native.json
+        ├── swig_referring_qwen3vl_native.json
+        └── swig_combined_qwen3vl_native.json
+```
 
-**Key Fix**: Dataset returns `None` instead of empty tensor for grounding tasks, ensuring training matches inference.
+## Inference Example
 
-### Stage 3: Instruction Finetuning
+```python
+from groma.model.groma_qwen import GromaQwenModel, GromaQwenConfig
+from transformers import AutoProcessor
 
-**Purpose**: Train LLM to use region features for HOI tasks (grounding + referring)
+# Load model
+model = GromaQwenModel.from_pretrained("checkpoints/groma-qwen-v2-stage2")
+processor = AutoProcessor.from_pretrained("checkpoints/groma-qwen-v2-stage2")
 
-**Configuration**: `groma/data/configs/vl_finetune_hoi_combined_qwen.py`
+# Initialize tokens
+tokenizer = processor.tokenizer
+model.init_special_token_id(tokenizer)
 
-**Datasets**: Same as Stage 2 (HICO-DET + SWIG-HOI Combined)
+# Prepare inputs
+image = Image.open("image.jpg")
+person_bbox = [100, 100, 200, 200]  # [x1, y1, x2, y2] in pixels
+object_bbox = [300, 300, 400, 400]
 
-**Training Setup**:
-- **Freeze**: Perceiver (DINOv2)
-- **Train**: LLM (Qwen3VL), VL Bridge, Region Encoder, New Token Embeddings
-- **Epochs**: 1
-- **Batch Size**: 4 per device × 8 GPUs × 4 gradient accumulation = 128 effective
+# Convert to [0, 1000] format
+w, h = image.size
+person_qwen = [int(c / w * 1000) if i % 2 == 0 else int(c / h * 1000) for i, c in enumerate(person_bbox)]
+object_qwen = [int(c / w * 1000) if i % 2 == 0 else int(c / h * 1000) for i, c in enumerate(object_bbox)]
 
-**Data Flow**: Same as Stage 2
-- **Grounding samples**: Skip region processing, use full image
-- **Referring samples**: Process regions, inject at `<refer_feat>`
+# Build prompt with native tokens
+prompt = f"""Action Recognition Task: The first region \
+<|object_ref_start|>person<|object_ref_end|>\
+<|box_start|>({person_qwen[0]},{person_qwen[1]}),({person_qwen[2]},{person_qwen[3]})<|box_end|> \
+contains a PERSON. The second region \
+<|object_ref_start|>object<|object_ref_end|>\
+<|box_start|>({object_qwen[0]},{object_qwen[1]}),({object_qwen[2]},{object_qwen[3]})<|box_end|> \
+contains an OBJECT. Describe the action."""
 
-**Key Fix**: Same fixes as Stage 2 ensure consistent behavior.
+# Generate
+refer_boxes = [torch.tensor([[person_qwen, object_qwen]], dtype=torch.float32)]
+output = model.generate(inputs, refer_boxes=refer_boxes, max_new_tokens=30)
+```
 
----
+## Evaluation
 
-## Critical Fixes Summary
+```bash
+# HICO-DET Action Referring
+python groma/eval/eval_hico_action_referring_groma_qwen_v2.py \
+    --model-name checkpoints/groma-qwen-v2-stage2 \
+    --img-prefix ../data/hico_20160224_det/images/test2015 \
+    --ann-file groma_data/benchmarks/hico_action_referring_test.json \
+    --pred-file results/hico_v2_predictions.json \
+    --verbose
+```
 
-### Fix 1: `<refer_feat>` Feature Injection (Critical Bug)
-**Location**: `groma/model/groma_qwen.py`
-- **Issue**: Visual features were not injected at `<refer_feat>` token positions
-- **Fix**: Added `refer_feat_token_id` initialization and injection logic in embedding hook
-- **Impact**: Referring tasks now receive visual context correctly
+## Benefits of V2 Architecture
 
-### Fix 2: Region Images Preparation
-**Location**: `groma/data/datasets/groma_qwen.py`
-- **Issue**: Dataset did not prepare `region_images` from bounding boxes
-- **Fix**: Added region cropping and resizing logic in `__getitem__`
-- **Impact**: Referring tasks now have proper region images during training
+1. **Simpler**: No external encoder (DINOv2), no custom tokens
+2. **Efficient**: Reuses Qwen3VL vision features
+3. **Less Training**: Only ROI Align + Bridge need training
+4. **Native Format**: Uses Qwen3VL's built-in bbox tokens
+5. **Better Generalization**: Model doesn't need to learn new token semantics
 
-### Fix 3: Grounding Task Training/Inference Mismatch
-**Location**: `groma/data/datasets/groma_qwen.py`, `groma/model/groma_qwen.py`
-- **Issue**: Training used empty tensors, inference used None → mismatch
-- **Fix**: Dataset returns `None` for empty `refer_boxes`, model checks for empty tensors
-- **Impact**: Grounding tasks now have consistent training/inference behavior
+## Migration from V1
 
-### Fix 4: Variable-Length Region Batching
-**Location**: `groma/data/collator.py`
-- **Issue**: `torch.stack()` failed when samples had different numbers of regions
-- **Fix**: Changed to `torch.cat()` to concatenate all regions
-- **Impact**: Batches with mixed region counts now work correctly
+If you have V1 checkpoints:
+1. The V2 model is not compatible with V1 checkpoints (different architecture)
+2. Regenerate datasets using `scripts/regenerate_datasets_qwen3vl_native.py`
+3. Train from scratch using `TASK_TYPE=referring` for best results
+4. V1 evaluation scripts still work with V1 checkpoints
 
----
+## Technical Implementation Notes
 
-## Current Status
+### Vision Feature Extraction
 
-✅ **All fixes implemented and verified**  
-✅ **Training and inference flows match for both grounding and referring tasks**  
-✅ **Ready for Stage 2 retraining**  
-✅ **Backward compatible with existing checkpoints**
+When using Qwen3VL's vision encoder with `output_hidden_states=True`:
+
+```python
+vision_outputs = visual(pixel_values, grid_thw=image_grid_thw, output_hidden_states=True)
+# Returns: (last_hidden_state, [hidden_states_list])
+# hidden_states_list contains 3 tensors from layers [8, 16, 24]
+# Each tensor has shape [L, 4096] (NOT [B, L, D] - no batch dimension!)
+```
+
+**Key observations:**
+1. **No batch dimension**: Hidden states are `[L, D]` not `[B, L, D]`
+2. **Post-projection dimensions**: 4096-dim (not 1152-dim raw patch embeddings)
+3. **Variable sequence length**: L = H × W where H, W depend on image aspect ratio
+
+### Spatial Reshaping for ROI Align
+
+Since Qwen3VL uses variable aspect ratios based on image dimensions:
+
+```python
+# Example: 640×427 image → grid_thw = [1, 26, 40] → 260 tokens (13×20 after merge)
+# Features shape: [260, 4096]
+
+# Reshape to spatial format:
+# 1. Add batch dimension: [1, 260, 4096]
+# 2. Find spatial factors: 260 = 13 × 20
+# 3. Reshape: [1, 13, 20, 4096] → [1, 4096, 13, 20]
+# 4. Interpolate to standard sizes: 32×32, 64×64, 128×128
+```
+
+### Checkpoint Compatibility
+
+⚠️ **Checkpoints trained with 1152-dim architecture are NOT compatible with 4096-dim architecture.**
+
+If you trained with an earlier version that used `config.vision_config.hidden_size` (1152), you must:
+1. Delete the old checkpoint
+2. Retrain from base Qwen3VL with the updated code

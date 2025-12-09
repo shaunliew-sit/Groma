@@ -90,8 +90,15 @@ class GromaTrainer(Trainer):
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
 
             if self.args.use_custom_lr:
+                # Handle custom_lr_params as comma-separated string or list
+                custom_lr_params = self.args.custom_lr_params
+                if custom_lr_params is None:
+                    custom_lr_params = []
+                elif isinstance(custom_lr_params, str):
+                    custom_lr_params = [p.strip() for p in custom_lr_params.split(',') if p.strip()]
+                
                 custom_parameters = [name for name, _ in opt_model.named_parameters() if
-                                     any(param in name for param in self.args.custom_lr_params)]
+                                     any(param in name for param in custom_lr_params)]
                 optimizer_grouped_parameters = [
                     {
                         "params": [p for n, p in opt_model.named_parameters() if

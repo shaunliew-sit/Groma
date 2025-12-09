@@ -1,42 +1,56 @@
 """
-[GROMA-QWEN] Groma Qwen3VL Model Implementation
-Part of: Groma Qwen3VL Referring Task Implementation
+[GROMA-QWEN V2] Groma Qwen3VL Native Architecture Model Implementation
+Part of: Groma Qwen3VL Native Architecture (No DINOv2, No New Tokens)
 
 Architecture Overview:
 ======================
-GromaQwenModel extends Qwen3VLForConditionalGeneration to support region-level understanding.
+GromaQwenModel extends Qwen3VLForConditionalGeneration to support region-level understanding
+using ONLY native Qwen3VL components - no external vision encoder (DINOv2) or new tokens.
+
+Key Design Principles:
+----------------------
+1. Reuse Qwen3VL Vision Encoder: Extract multi-level features from Qwen3VL's own vision encoder
+   using deepstack_visual_indexes [8, 16, 24] for ROI Align
+2. Native Tokens Only: Use Qwen3VL's built-in bbox tokens (<|box_start|>, <|box_end|>, etc.)
+   instead of custom tokens (<region>, <refer_feat>, etc.)
+3. Minimal Additions: Only add ROI Align module + Image-to-Text Bridge
+4. Forward Hook: Inject region features at <|box_end|> token positions
 
 Components:
 -----------
-1. Base LLM: Qwen3VL-8B-Instruct (frozen during Stage 2, trained during Stage 3)
-2. DINOv2 Visual Encoder (vis_encoder): Extracts fine-grained visual features from region crops
-   - Model: facebook/dinov2-large (1024-dim hidden, 24 layers)
-   - Always frozen - provides robust visual representations
-3. Region Encoder (region_encoder): MLVLROIQueryModule from roi_align.py
-   - Multi-level feature fusion from last 3 DINOv2 layers
+1. Base LLM: Qwen3VL (frozen during training)
+2. Base Vision: Qwen3VL Vision Encoder (frozen, reused for region features)
+3. Region Encoder (region_encoder): MLVLROIQueryModule
+   - Multi-level feature fusion from Qwen3VL vision layers [8, 16, 24]
    - ROI Align to extract features for specific bounding boxes
    - Outputs 4096-dim region features
-4. VL Bridge (img_txt_bridge): Projects region features to LLM embedding space
-   - Linear(4096 -> text_embed_dim) + GELU + Linear(text_embed_dim -> text_embed_dim)
-   - Trained during Stage 2 & 3
-5. New Token Embeddings (new_input_embs): For special tokens like <r0>...<r99>, <region>, etc.
-   - Trained during Stage 3
+4. Image-to-Text Bridge (img_txt_bridge): Projects region features to LLM embedding space
+   - Linear(4096 -> 4096) + GELU + Linear(4096 -> 4096)
+   - Trained during Stage 2
 
-Key Changes for Referring Task:
--------------------------------
-- prepare_inputs_for_generation(): Preserves region_images and refer_boxes during generation
-- forward(): Injects region features at both <region> AND <refer_feat> token positions
-  (Critical fix: originally only injected at <region>, causing referring task failures)
-- Embedding hook mechanism to inject custom embeddings while preserving RoPE compatibility
+Native Qwen3VL Tokens Used:
+---------------------------
+- <|object_ref_start|> (151646): Start of object reference
+- <|object_ref_end|> (151647): End of object reference  
+- <|box_start|> (151648): Start of bounding box
+- <|box_end|> (151649): End of bounding box - INJECTION POINT for region features
+- <|vision_start|> (151652): Start of vision content
+- <|vision_end|> (151653): End of vision content
 
 Data Flow (Referring Task):
 ---------------------------
-Input: Image + 2 bounding boxes (person, object) + prompt with <refer_feat> tokens
-1. Region crops -> DINOv2 -> Multi-level features (last 3 layers)
-2. Bounding boxes -> ROI Align -> Region features (4096-dim per region)
-3. Region features -> VL Bridge -> LLM-compatible embeddings
-4. Embeddings injected at <refer_feat> positions via forward hook
+Input: Image + 2 bounding boxes (person, object) + prompt with native bbox tokens
+1. Full Image -> Qwen3VL Vision Encoder -> Extract features from layers [8, 16, 24]
+2. Bounding boxes -> ROI Align on Qwen3VL features -> Region features (4096-dim per region)
+3. Region features -> Image-to-Text Bridge -> Projected features (4096-dim)
+4. Embeddings injected at <|box_end|> positions via forward hook
 5. LLM generates action description (e.g., "riding bicycle")
+
+Training Strategy:
+------------------
+Stage 2 Only (frozen Qwen3VL):
+- Freeze: Qwen3VL LLM + Qwen3VL Vision Encoder
+- Train: ROI Align module + Image-to-Text Bridge
 """
 
 import torch
@@ -45,22 +59,32 @@ from typing import List, Optional, Tuple, Union
 from transformers import (
     Qwen3VLConfig,
     Qwen3VLForConditionalGeneration,
-    Dinov2Model,
-    Dinov2Config,
     PretrainedConfig
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from groma.model.roi_align import MLVLROIQueryModule
-from groma.constants import DEFAULT_TOKENS, REGION_IDX_TOKENS
+from groma.model.roi_align import MLVLROIQueryModule, QWEN3VL_VISION_HIDDEN_SIZE
+
+
+# Native Qwen3VL bbox token IDs
+QWEN3VL_BOX_START_TOKEN_ID = 151648
+QWEN3VL_BOX_END_TOKEN_ID = 151649
+QWEN3VL_OBJECT_REF_START_TOKEN_ID = 151646
+QWEN3VL_OBJECT_REF_END_TOKEN_ID = 151647
+
 
 class GromaQwenConfig(Qwen3VLConfig):
+    """Configuration for GromaQwenModel.
+    
+    This config extends Qwen3VLConfig with Groma-specific settings.
+    Note: num_new_token is kept for backward compatibility but set to 0
+    since we use native Qwen3VL tokens only.
+    """
     model_type = "groma_qwen"
 
     def __init__(
         self,
-        vis_encoder_cfg=None,
-        num_new_token=0,
         roi_align_cfg=None,
+        num_new_token=0,  # Kept for backward compatibility, always 0 in V2
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -74,28 +98,8 @@ class GromaQwenConfig(Qwen3VLConfig):
                 if not hasattr(self.vision_config, "rope_scaling") or self.vision_config.rope_scaling is None:
                     self.vision_config.rope_scaling = self.rope_scaling
         
-        # Default to facebook/dinov2-large config if not provided
-        if vis_encoder_cfg is None:
-            # We can't load from string here easily without connection, 
-            # but we can set default dict for dinov2-large
-            self.vis_encoder_cfg = Dinov2Config(
-                hidden_size=1024,
-                num_hidden_layers=24,
-                num_attention_heads=16,
-                mlp_ratio=4,
-                hidden_act="gelu",
-                image_size=518, # DINOv2 large default
-                patch_size=14
-            )
-        elif isinstance(vis_encoder_cfg, dict):
-            self.vis_encoder_cfg = Dinov2Config(**vis_encoder_cfg)
-        elif isinstance(vis_encoder_cfg, Dinov2Config):
-            self.vis_encoder_cfg = vis_encoder_cfg
-        else:
-            self.vis_encoder_cfg = vis_encoder_cfg
-
-        self.num_new_token = num_new_token
         self.roi_align_cfg = roi_align_cfg if roi_align_cfg is not None else {}
+        self.num_new_token = num_new_token  # Always 0 in V2, kept for compatibility
         
         # Explicitly set loss_type to suppress warning
         if not hasattr(self, "loss_type") or self.loss_type is None:
@@ -103,102 +107,152 @@ class GromaQwenConfig(Qwen3VLConfig):
 
 
 class GromaQwenModel(Qwen3VLForConditionalGeneration):
+    """Groma-Qwen Model with Native Qwen3VL Architecture.
+    
+    This model extends Qwen3VLForConditionalGeneration to support region-level
+    understanding using only native Qwen3VL components:
+    - Reuses Qwen3VL vision encoder for region features
+    - Uses native bbox tokens (<|box_start|>, <|box_end|>)
+    - Adds only ROI Align + Image-to-Text Bridge
+    """
     config_class = GromaQwenConfig
 
     def __init__(self, config: GromaQwenConfig):
         super().__init__(config)
-
-        # 1. Initialize Region Encoder Backbone (DINOv2) - Frozen
-        # Load DINOv2 from config (weights will be loaded from checkpoint via from_pretrained)
-        print("Initializing DINOv2 encoder from config...")
-        self.vis_encoder = Dinov2Model(config.vis_encoder_cfg)
-        self.vis_encoder.requires_grad_(False) # Freeze DINOv2
-
-        # 2. Initialize Region Encoder Head (ROI Align + Fusion) - Trained
-        # DINOv2 Large hidden size = 1024
-        # Use the actual hidden size from the loaded encoder to avoid mismatch
-        image_embed_dim = self.vis_encoder.config.hidden_size 
-        image_embed_dim = self.vis_encoder.config.hidden_size 
-        # Qwen3VLConfig might store hidden_size in text_config or directly
+        
+        # Get LLM hidden size
         text_embed_dim = getattr(config, "hidden_size", None)
         if text_embed_dim is None:
             if hasattr(config, "text_config"):
                 text_embed_dim = getattr(config.text_config, "hidden_size", 4096)
             else:
-                text_embed_dim = 4096 # Fallback default for 7B/8B models
+                text_embed_dim = 4096  # Fallback default for 7B/8B models
         
-        # MLVLROIQueryModule takes (embed_dims, out_dims, num_levels)
-        # Note: out_dims in MLVLROIQueryModule init seems unused in forward? 
-        # It returns query_feats from MlvlRoIExtractor.
-        # MlvlRoIExtractor outputs 'out_channels' which is set to embed_dims (1024).
-        # Then MlvlRoIExtractor has a linear updims 1024 -> 4096.
-        # We need to check if 4096 is hardcoded or passed.
+        # Vision hidden states are post-projection, matching LLM hidden size (4096)
+        # Note: config.vision_config.hidden_size = 1152 (raw patch embeddings)
+        # but output_hidden_states returns 4096-dim post-projection features
+        vision_hidden_size = QWEN3VL_VISION_HIDDEN_SIZE  # 4096 for post-projection features
+        
+        # Get deepstack_visual_indexes for multi-level features
+        self.deepstack_visual_indexes = [8, 16, 24]  # Default Qwen3VL indexes
+        if hasattr(config, "vision_config") and hasattr(config.vision_config, "deepstack_visual_indexes"):
+            self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
+        
+        print(f"[GromaQwenModel V2] Initializing with:")
+        print(f"  - Vision hidden size: {vision_hidden_size}")
+        print(f"  - LLM hidden size: {text_embed_dim}")
+        print(f"  - Deepstack visual indexes: {self.deepstack_visual_indexes}")
+        print(f"  - Using native Qwen3VL bbox tokens (no new tokens)")
+        
+        # Region Encoder (ROI Align + Multi-Level Fusion) - TRAINED
+        # Uses Qwen3VL vision hidden size (4096, post-projection)
         self.region_encoder = MLVLROIQueryModule(
-            embed_dims=image_embed_dim, 
-            out_dims=4096, # This parameter is passed to MlvlRoIExtractor
-            num_levels=3
+            embed_dims=vision_hidden_size,
+            out_dims=4096,
+            num_levels=len(self.deepstack_visual_indexes)
         )
         
-        # Bridge to project region features to LLM space
-        # The region encoder (MlvlRoIExtractor) outputs features of dimension 4096.
-        # We project this to the LLM's hidden size (text_embed_dim).
+        # Image-to-Text Bridge - TRAINED
+        # Projects region features to LLM space
         self.img_txt_bridge = nn.Sequential(
             nn.Linear(4096, text_embed_dim),
             nn.GELU(),
             nn.Linear(text_embed_dim, text_embed_dim),
         )
         
-        # 3. Special Tokens Embeddings - Trained
-        # Handles <r0>...<r99>, <region>, etc.
-        self.new_input_embs = nn.Embedding(config.num_new_token, text_embed_dim)
+        # Native Qwen3VL bbox token IDs (will be verified in init_special_token_id)
+        self.box_end_token_id = QWEN3VL_BOX_END_TOKEN_ID
+        self.box_start_token_id = QWEN3VL_BOX_START_TOKEN_ID
         
-        # Initialize with average of existing embeddings
-        # Use get_input_embeddings() for compatibility
-        embed_tokens = self.model.get_input_embeddings()
-        if embed_tokens is not None:
-            with torch.no_grad():
-                input_embeds = embed_tokens.weight.data
-                input_embeds_avg = input_embeds.mean(dim=0, keepdim=True)
-                self.new_input_embs.weight.data.copy_(input_embeds_avg.expand(config.num_new_token, -1))
+        # Legacy attributes for backward compatibility (not used in V2)
+        self.reg_token_id = None
+        self.refer_feat_token_id = None
+        self.box_idx_token_ids = None
+        
+        # Store vision hidden states from last forward pass
+        self._cached_vision_hidden_states = None
 
-        # Token IDs
+    def init_special_token_id(self, tokenizer):
+        """Initialize and verify native Qwen3VL bbox token IDs.
+        
+        Unlike V1, this method only verifies native tokens exist - no new tokens are added.
+        """
+        # Verify native bbox tokens
+        self.box_end_token_id = tokenizer.convert_tokens_to_ids("<|box_end|>")
+        self.box_start_token_id = tokenizer.convert_tokens_to_ids("<|box_start|>")
+        
+        if self.box_end_token_id == tokenizer.unk_token_id:
+            raise ValueError(
+                "Native Qwen3VL token <|box_end|> not found in tokenizer. "
+                "Please ensure you're using Qwen3-VL tokenizer."
+            )
+        if self.box_start_token_id == tokenizer.unk_token_id:
+            raise ValueError(
+                "Native Qwen3VL token <|box_start|> not found in tokenizer. "
+                "Please ensure you're using Qwen3-VL tokenizer."
+            )
+        
+        print(f"[GromaQwenModel V2] Native bbox tokens verified:")
+        print(f"  - <|box_start|>: {self.box_start_token_id}")
+        print(f"  - <|box_end|>: {self.box_end_token_id}")
+        
+        # Legacy: Set to None as we don't use custom tokens
         self.reg_token_id = None
         self.refer_feat_token_id = None
         self.box_idx_token_ids = None
 
-    def init_special_token_id(self, tokenizer):
-        # Ensure these tokens are in tokenizer
-        self.reg_token_id = tokenizer.convert_tokens_to_ids(DEFAULT_TOKENS['region'])
-        self.refer_feat_token_id = tokenizer.convert_tokens_to_ids(DEFAULT_TOKENS['rfeat'])
-        self.box_idx_token_ids = tokenizer.convert_tokens_to_ids(REGION_IDX_TOKENS)
-
-    def _compute_custom_embeddings(self, input_ids):
-        # Combine original Qwen embeddings with new special token embeddings
-        ori_vocab_size = self.config.vocab_size
+    def _extract_vision_features(self, pixel_values, image_grid_thw):
+        """Extract multi-level features from Qwen3VL vision encoder.
         
-        # Mask for new tokens (assuming they are appended > vocab_size)
-        # Note: Qwen3VL might have large vocab. We assume new tokens are added AT THE END.
-        # We need to know the original vocab size BEFORE adding new tokens to know the boundary.
-        # Or we can check if ID >= config.vocab_size (if config isn't updated yet).
-        # Safer: use a known offset or check against current model embedding size.
+        This method extracts hidden states from the vision encoder at the
+        deepstack_visual_indexes layers for use in ROI Align.
         
-        ori_embed_tokens = self.model.get_input_embeddings()
-        num_ori_tokens = ori_embed_tokens.num_embeddings
+        Args:
+            pixel_values: Input image tensor
+            image_grid_thw: Image grid dimensions (temporal, height, width)
         
-        mask = input_ids >= num_ori_tokens
+        Returns:
+            List of hidden states from deepstack layers (typically 3 tensors)
+        """
+        if pixel_values is None:
+            return None
         
-        # Get original embeddings
-        ori_ids = input_ids.masked_fill(mask, 0)
-        input_embeddings = ori_embed_tokens(ori_ids)
+        # Get the visual model (vision encoder)
+        visual = self.visual
         
-        # Get new embeddings
-        new_ids = input_ids - num_ori_tokens
-        new_ids = new_ids.masked_fill(~mask, 0)
-        new_input_embeddings = self.new_input_embs(new_ids)
+        # Process through vision encoder with hidden states output
+        # Qwen3VL returns: (final_hidden_state, [hidden_states_list])
+        # where hidden_states_list contains tensors from deepstack_visual_indexes layers
+        with torch.no_grad():
+            vision_outputs = visual(
+                pixel_values,
+                grid_thw=image_grid_thw,
+                output_hidden_states=True
+            )
+            
+            # Qwen3VL vision encoder returns tuple: (last_hidden_state, hidden_states_list)
+            # hidden_states_list is already extracted from deepstack layers [8, 16, 24]
+            if isinstance(vision_outputs, tuple) and len(vision_outputs) > 1:
+                hidden_states = vision_outputs[1]
+                
+                # hidden_states is a list of tensors, one per deepstack layer
+                if isinstance(hidden_states, (list, tuple)):
+                    # Use the hidden states directly - they're already from the right layers
+                    mlvl_feats = list(hidden_states)
+                else:
+                    # Single tensor case
+                    mlvl_feats = [hidden_states]
+            elif hasattr(vision_outputs, 'hidden_states'):
+                hidden_states = vision_outputs.hidden_states
+                mlvl_feats = list(hidden_states) if isinstance(hidden_states, (list, tuple)) else [hidden_states]
+            else:
+                # Fallback: use the output directly
+                if isinstance(vision_outputs, tuple):
+                    mlvl_feats = [vision_outputs[0]]
+                else:
+                    mlvl_feats = [vision_outputs]
         
-        # Combine
-        input_embeddings[mask] = new_input_embeddings[mask]
-        return input_embeddings
+        return mlvl_feats
 
     def prepare_inputs_for_generation(
         self,
@@ -214,18 +268,16 @@ class GromaQwenModel(Qwen3VLForConditionalGeneration):
         image_grid_thw=None,
         video_grid_thw=None,
         # Groma specific args
-        region_images=None,
         refer_boxes=None,
+        vision_hidden_states=None,  # Pre-extracted vision features
         **kwargs,
     ):
-        """
-        Override prepare_inputs_for_generation to preserve region_images and refer_boxes
-        during generation. These parameters are needed for referring tasks.
+        """Override prepare_inputs_for_generation to preserve Groma parameters.
         
-        Without this override, region_images and refer_boxes would be lost after the first
-        generation step, causing referring tasks to fail during multi-step generation.
+        Note: In V2, we pass vision_hidden_states instead of region_images,
+        since we extract features from Qwen3VL vision encoder directly.
         """
-        # Call parent's prepare_inputs_for_generation to handle standard Qwen3VL parameters
+        # Call parent's prepare_inputs_for_generation
         model_inputs = super().prepare_inputs_for_generation(
             input_ids=input_ids,
             past_key_values=past_key_values,
@@ -242,12 +294,10 @@ class GromaQwenModel(Qwen3VLForConditionalGeneration):
         )
         
         # Preserve Groma-specific parameters
-        # These are needed for referring tasks where region features must be injected
-        # at <refer_feat> token positions during each generation step
-        if region_images is not None:
-            model_inputs["region_images"] = region_images
         if refer_boxes is not None:
             model_inputs["refer_boxes"] = refer_boxes
+        if vision_hidden_states is not None:
+            model_inputs["vision_hidden_states"] = vision_hidden_states
         
         return model_inputs
 
@@ -269,111 +319,92 @@ class GromaQwenModel(Qwen3VLForConditionalGeneration):
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         # Groma specific args
-        region_images: Optional[torch.Tensor] = None, # Images for DINOv2 (B, C, H, W)
-        refer_boxes: Optional[List[torch.Tensor]] = None, # Boxes for ROI Align (B, N, 4)
+        refer_boxes: Optional[List[torch.Tensor]] = None,  # Boxes for ROI Align (list of [N, 4] tensors)
+        vision_hidden_states: Optional[List[torch.Tensor]] = None,  # Pre-extracted features
         **kwargs
     ):
+        """Forward pass with region feature injection at <|box_end|> positions.
         
-        # We cannot pass inputs_embeds to Qwen3VL because it requires input_ids for RoPE,
-        # but forbids passing both.
-        # Solution: Use a forward hook on embed_tokens to inject our custom embeddings
-        # while passing masked input_ids to Qwen.
+        Key differences from V1:
+        - No DINOv2 encoder - uses Qwen3VL vision features
+        - No new token embeddings - uses native Qwen3VL tokens
+        - Injects at <|box_end|> positions instead of <region>/<refer_feat>
+        """
         
         region_features_proj = None
         
-        # 1. Process Regions (if present)
-        # Check for None AND non-empty tensors (empty tensors should be treated as None)
-        # This ensures grounding tasks (which have no refer_boxes) skip region processing
+        # 1. Check if we have regions to process
         has_regions = (
-            region_images is not None 
-            and refer_boxes is not None
-            and (isinstance(region_images, torch.Tensor) and region_images.shape[0] > 0)
+            refer_boxes is not None
             and (isinstance(refer_boxes, list) and len(refer_boxes) > 0 and refer_boxes[0].shape[0] > 0)
         )
         
         if has_regions:
-            # Get model dtype for consistency
-            model_dtype = next(self.region_encoder.parameters()).dtype
+            # 2. Get vision features (extract or use cached)
+            if vision_hidden_states is not None:
+                # Use pre-extracted features
+                mlvl_feats = vision_hidden_states
+            elif pixel_values is not None:
+                # Extract features from Qwen3VL vision encoder
+                mlvl_feats = self._extract_vision_features(pixel_values, image_grid_thw)
+            else:
+                # No vision input, skip region processing
+                mlvl_feats = None
             
-            # Ensure region_images are in the right dtype (DINOv2 can handle both)
-            # Convert to float32 for DINOv2 (it expects float32), then convert outputs
-            region_images_float = region_images.float() if region_images.dtype != torch.float32 else region_images
-            
-            # region_images: (B, C, H, W)
-            with torch.no_grad():
-                # DINOv2 Forward (outputs float32)
-                vis_outputs = self.vis_encoder(region_images_float, output_hidden_states=True)
+            if mlvl_feats is not None:
+                # Get model dtype for consistency
+                model_dtype = next(self.region_encoder.parameters()).dtype
                 
-                # Extract Last 3 Layers
-                mlvl_feats = vis_outputs.hidden_states[-3:]
-                # Remove CLS token (index 0) -> (B, L-1, D)
-                mlvl_feats = [f[:, 1:] for f in mlvl_feats]
-            
-            # Convert DINOv2 features to model dtype (bfloat16) to match region encoder weights
-            # DINOv2 outputs float32, but region encoder expects bfloat16 when model is in bfloat16
-            mlvl_feats = [f.to(dtype=model_dtype) for f in mlvl_feats]
-            
-            # Coordinate Alignment (0-1000 -> 0-1)
-            norm_refer_boxes = [box.float() / 1000.0 for box in refer_boxes]
-            
-            # Region Encoder
-            region_features = self.region_encoder(mlvl_feats, norm_refer_boxes)
-            
-            # Project to LLM dim
-            region_features_flat = torch.cat(region_features, dim=0) 
-            region_features_proj = self.img_txt_bridge(region_features_flat)
-
-        # 2. Prepare Masked Input IDs and Hook
-        # We mask new tokens in input_ids so embed_tokens doesn't crash
-        ori_vocab_size = self.model.get_input_embeddings().num_embeddings
+                # Convert features to model dtype
+                mlvl_feats = [f.to(dtype=model_dtype) for f in mlvl_feats]
+                
+                # Coordinate Alignment (0-1000 -> 0-1)
+                norm_refer_boxes = [box.float() / 1000.0 for box in refer_boxes]
+                
+                # Region Encoder (ROI Align + Multi-Level Fusion)
+                # Pass image_grid_thw for proper spatial reshaping
+                region_features = self.region_encoder(mlvl_feats, norm_refer_boxes, image_grid_thw)
+                
+                # Project to LLM dim via Image-to-Text Bridge
+                region_features_flat = torch.cat(region_features, dim=0)
+                region_features_proj = self.img_txt_bridge(region_features_flat)
         
-        if input_ids is not None:
-            # Identify new tokens
-            new_token_mask = input_ids >= ori_vocab_size
-            
-            # Mask them with 0 (or any valid ID) for the base model call
-            masked_input_ids = input_ids.masked_fill(new_token_mask, 0)
-            
-            # Define Hook
+        # 3. Set up embedding hook if we have region features to inject
+        if input_ids is not None and region_features_proj is not None:
+            # Define Hook to inject at <|box_end|> positions
             def embedding_hook(module, inputs, output):
-                # output is the embedding of masked_input_ids
-                # We replace embeddings for new tokens and region tokens
+                """Inject region features at <|box_end|> token positions."""
+                # Find <|box_end|> positions
+                box_end_mask = input_ids == self.box_end_token_id
                 
-                # 1. Inject New Token Embeddings (e.g. <r0>, <p>)
-                if new_token_mask.any():
-                    new_ids = input_ids - ori_vocab_size
-                    new_ids = new_ids.masked_fill(~new_token_mask, 0)
-                    new_embeds = self.new_input_embs(new_ids)
-                    output[new_token_mask] = new_embeds[new_token_mask].to(output.dtype)
+                # Safety check: number of <|box_end|> tokens should match region features
+                num_box_end = box_end_mask.sum().item()
+                num_features = region_features_proj.shape[0]
                 
-                # 2. Inject Region Features (at <region> token positions)
-                if region_features_proj is not None and self.reg_token_id is not None:
-                    reg_mask = input_ids == self.reg_token_id
-                    # Safety check
-                    if reg_mask.sum() == region_features_proj.shape[0]:
-                        output.masked_scatter_(reg_mask.unsqueeze(-1), region_features_proj.to(output.dtype))
+                if num_box_end > 0 and num_box_end == num_features:
+                    # Inject region features at <|box_end|> positions
+                    output.masked_scatter_(
+                        box_end_mask.unsqueeze(-1).expand_as(output),
+                        region_features_proj.to(output.dtype)
+                    )
+                elif num_box_end > 0 and num_features > 0:
+                    # Partial injection if counts don't match
+                    # This can happen during generation when only some tokens are processed
+                    pass
                 
-                # 3. Inject Region Features at <refer_feat> token positions (for referring tasks)
-                # This is critical for action referring tasks where <refer_feat> tokens need visual features
-                if region_features_proj is not None and self.refer_feat_token_id is not None:
-                    ref_feat_mask = input_ids == self.refer_feat_token_id
-                    # Safety check: number of <refer_feat> tokens should match number of region features
-                    if ref_feat_mask.sum() > 0 and ref_feat_mask.sum() == region_features_proj.shape[0]:
-                        output.masked_scatter_(ref_feat_mask.unsqueeze(-1), region_features_proj.to(output.dtype))
-                    
                 return output
-
+            
             # Register Hook
             hook_handle = self.model.get_input_embeddings().register_forward_hook(embedding_hook)
             
             try:
-                # 3. Pass to Qwen with masked_input_ids
+                # 4. Forward through Qwen3VL
                 return super().forward(
-                    input_ids=masked_input_ids,
+                    input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_values=past_key_values,
-                    inputs_embeds=None, # We let Qwen compute embeddings (which triggers our hook)
+                    inputs_embeds=None,
                     labels=labels,
                     use_cache=False if self.training else use_cache,
                     output_attentions=output_attentions,
@@ -389,11 +420,47 @@ class GromaQwenModel(Qwen3VLForConditionalGeneration):
                 # Remove hook
                 hook_handle.remove()
         else:
-            # Fallback if input_ids is None (e.g. generation loop with past_key_values?)
-            # If input_ids is None, Qwen might crash anyway as seen before.
-            # But if inputs_embeds IS provided (e.g. by user), we pass it.
+            # No region features to inject - standard forward pass
             return super().forward(
-                input_ids=None,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
                 inputs_embeds=inputs_embeds,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
                 **kwargs
             )
+    
+    def generate(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        refer_boxes: Optional[List[torch.Tensor]] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        **kwargs
+    ):
+        """Generate with region feature injection.
+        
+        Pre-extracts vision features before generation to avoid repeated computation.
+        """
+        # Pre-extract vision features if we have regions
+        vision_hidden_states = None
+        if refer_boxes is not None and pixel_values is not None:
+            vision_hidden_states = self._extract_vision_features(pixel_values, image_grid_thw)
+        
+        return super().generate(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            refer_boxes=refer_boxes,
+            vision_hidden_states=vision_hidden_states,
+            **kwargs
+        )

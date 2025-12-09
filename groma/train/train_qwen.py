@@ -1,208 +1,214 @@
-# [GROMA-QWEN] Training script for GromaQwenModel
-# Part of: Groma Qwen3VL Referring Task Implementation
-# Adapted from groma/train/train.py
+# [GROMA-QWEN V2] Training script for GromaQwenModel (Native Architecture)
+# Part of: Groma Qwen3VL Native Architecture (No DINOv2, No New Tokens)
 #
-# Training Stages:
-# ================
-# Stage 2 (VL Alignment Pretraining):
-#   - freeze_llm=True, freeze_perceiver=True (DINOv2 always frozen)
-#   - Trains: VL Bridge (img_txt_bridge), Region Encoder (region_encoder)
-#   - Uses: scripts/vl_pretrain_hoi_combined.sh
-#   - Config: groma/data/configs/vl_pretrain_hoi_combined.py
+# Key Changes from V1:
+# ====================
+# - No new token addition (uses native Qwen3VL tokens only)
+# - No DINOv2 image processor (uses Qwen3VL processor)
+# - Simplified freeze logic (only LLM freeze, no perceiver)
 #
-# Stage 3 (Instruction Finetuning):
-#   - freeze_llm=False, freeze_perceiver=True
-#   - Trains: LLM, VL Bridge, Region Encoder, New Token Embeddings
-#   - Uses: scripts/vl_finetune_referring_only.sh (referring-only)
-#   - Config: groma/data/configs/vl_finetune_referring_only_qwen.py
+# Training Strategy:
+# ==================
+# Stage 2 Only (recommended):
+#   --freeze_llm True
+#   Trains: ROI Align module + Image-to-Text Bridge
+#   Frozen: Qwen3VL LLM + Vision Encoder
 #
-# Key Features:
-# -------------
-# - Supports loading from Stage 2 checkpoint for Stage 3
-# - Adds special tokens (<region>, <refer_feat>, <r0>...<r99>, etc.)
-# - Uses GromaTrainer with gradient checkpointing support
-# - Integrates with WandB for experiment tracking
+# Dataset Selection:
+# ==================
+# Set TASK_TYPE environment variable:
+#   TASK_TYPE=referring  - Train on referring task only
+#   TASK_TYPE=grounding  - Train on grounding task only
+#   TASK_TYPE=both       - Train on both tasks (default)
 #
+# Example:
+# ========
+# TASK_TYPE=referring deepspeed --num_gpus=8 \
+#     -m groma.train.train_qwen \
+#     --llm checkpoints/Qwen3-VL-8B-Instruct \
+#     --output_dir checkpoints/groma-qwen-v2-stage2 \
+#     --dataset_config groma/data/configs/vl_train_stage2_qwen3vl_native.py \
+#     --freeze_llm True \
+#     --per_device_train_batch_size 4 \
+#     --num_train_epochs 4 \
+#     --learning_rate 2e-4
 
 import torch
 import pathlib
 import transformers
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence, List
-from transformers import AutoImageProcessor, AutoTokenizer
+from typing import Optional
+from transformers import AutoProcessor, AutoTokenizer
 
 from groma.model.groma_qwen import GromaQwenConfig, GromaQwenModel
 from groma.data.build import build_multi_datasets
 from groma.data.collator import DataCollatorForHybridDataset
-from groma.constants import DEFAULT_TOKENS, REGION_IDX_TOKENS
 from groma.train.groma_trainer import GromaTrainer
+
 
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default=None)
     llm: Optional[str] = field(default=None)
-    perceiver: Optional[str] = field(default=None) # Path to DINOv2 or ignored
-    nms_thres: Optional[float] = field(default=0.6)
-    box_score_thres: Optional[float] = field(default=0.)
-    max_region_num: Optional[int] = field(default=100)
+    # Kept for backward compatibility, not used in V2
+    perceiver: Optional[str] = field(default=None)
 
 
 @dataclass
 class DataArguments:
-    dataset_config: str = field(default='groma/datasets/dataset_configs.py')
+    dataset_config: str = field(default='groma/data/configs/vl_train_stage2_qwen3vl_native.py')
 
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
-    freeze_llm: bool = field(default=False)
-    freeze_perceiver: bool = field(default=True)
+    freeze_llm: bool = field(default=True)  # Default True for Stage 2
     freeze_vl_bridge: bool = field(default=False)
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
     remove_unused_columns: bool = field(default=False)
     ddp_find_unused_parameters: bool = field(default=True)
-    model_max_length: int = field(default=512)
-    use_custom_lr: bool = field(default=False)
-    custom_lr_params: tuple = field(default=('perceiver', 'llm'))
-    custom_lr: float = field(default=2e-5)
+    model_max_length: int = field(default=2048)
     group_by_data_source: Optional[bool] = field(default=True)
+    # Custom learning rate settings (used by GromaTrainer)
+    use_custom_lr: bool = field(default=False)
+    custom_lr: float = field(default=1e-4)
+    custom_lr_params: Optional[str] = field(
+        default=None,
+        metadata={"help": "Comma-separated list of parameter name patterns for custom LR"}
+    )
 
 
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    # Load Tokenizer (Qwen3-VL)
+    # Determine tokenizer source
     tokenizer_path = model_args.model_name_or_path if model_args.model_name_or_path else model_args.llm
+    
+    print("=" * 60)
+    print("[GROMA-QWEN V2] Training with Native Qwen3VL Architecture")
+    print("=" * 60)
+    
+    # Load Tokenizer
+    print(f"\n[1] Loading tokenizer from: {tokenizer_path}")
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_path,
         cache_dir=training_args.cache_dir,
         model_max_length=training_args.model_max_length,
         padding_side="right",
         use_fast=False,
-        trust_remote_code=True 
+        trust_remote_code=True
     )
     
-    # Verify Qwen3-VL tokenizer (not Qwen2-VL)
+    # Verify Qwen3-VL tokenizer
     name_or_path = getattr(tokenizer, 'name_or_path', '') or ''
-    if isinstance(name_or_path, str):
-        name_lower = name_or_path.lower()
-        if 'qwen2' in name_lower or 'qwen2-vl' in name_lower:
-            print(f"⚠️  WARNING: Detected Qwen2-VL tokenizer: {name_or_path}")
-            print("   This training script requires Qwen3-VL tokenizer!")
-            print("   Please ensure tokenizer_path points to Qwen3-VL-8B-Instruct")
-        elif 'qwen3' in name_lower or 'qwen3-vl' in name_lower:
-            print(f"✓ Verified Qwen3-VL tokenizer: {name_or_path}")
+    if 'qwen2' in name_or_path.lower():
+        print(f"⚠️  WARNING: Detected Qwen2-VL tokenizer: {name_or_path}")
+        print("   This training script requires Qwen3-VL tokenizer!")
+    elif 'qwen3' in name_or_path.lower():
+        print(f"✓ Verified Qwen3-VL tokenizer")
     
-    # Verify apply_chat_template method exists (required for Qwen3VL template)
-    if not hasattr(tokenizer, 'apply_chat_template'):
-        raise ValueError(
-            "Tokenizer must have apply_chat_template method for Qwen3VL template. "
-            f"Tokenizer path: {tokenizer_path}. "
-            "Please ensure you're using Qwen3-VL tokenizer from Groma/checkpoints/Qwen3-VL-8B-Instruct"
-        )
-    print("✓ Tokenizer has apply_chat_template method")
+    # Verify native bbox tokens exist
+    box_start_id = tokenizer.convert_tokens_to_ids("<|box_start|>")
+    box_end_id = tokenizer.convert_tokens_to_ids("<|box_end|>")
     
-    # Verify EOS token ID (should be 151645 for Qwen3-VL)
-    eos_token_id = getattr(tokenizer, 'eos_token_id', None)
-    im_end_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-    if im_end_token_id != tokenizer.unk_token_id:
-        expected_eos = 151645
-        if im_end_token_id == expected_eos:
-            print(f"✓ EOS token ID verified: {im_end_token_id} (<|im_end|>)")
-        else:
-            print(f"⚠️  WARNING: <|im_end|> token ID is {im_end_token_id}, expected {expected_eos}")
-    else:
-        print("⚠️  WARNING: Could not find <|im_end|> token in vocabulary")
+    if box_start_id == tokenizer.unk_token_id:
+        raise ValueError("Native token <|box_start|> not found in tokenizer")
+    if box_end_id == tokenizer.unk_token_id:
+        raise ValueError("Native token <|box_end|> not found in tokenizer")
     
-    # Add special tokens
-    # Qwen tokenizer might already have some, but we add Groma tokens
-    # Check if tokens exist first to avoid duplicates (handled by tokenizer.add_tokens usually)
-    num_new_token = tokenizer.add_tokens(list(DEFAULT_TOKENS.values()) + REGION_IDX_TOKENS, special_tokens=True)
+    print(f"✓ Native bbox tokens verified:")
+    print(f"  - <|box_start|>: {box_start_id}")
+    print(f"  - <|box_end|>: {box_end_id}")
     
     # Ensure pad token is set
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = DEFAULT_TOKENS['pad']
-
+        tokenizer.pad_token = tokenizer.eos_token
+        print(f"✓ Set pad_token to eos_token: {tokenizer.pad_token}")
+    
     # Initialize Model
+    print(f"\n[2] Initializing model...")
+    
     if model_args.model_name_or_path:
-        # Resume from checkpoint or load finetuned model
+        # Resume from checkpoint
+        print(f"   Loading from checkpoint: {model_args.model_name_or_path}")
         model = GromaQwenModel.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
             trust_remote_code=True
         )
     elif model_args.llm:
-        # Initialize from LLM + Perceiver (Stage 2)
-        # We assume model_args.llm points to Qwen base
+        # Initialize from base LLM
+        print(f"   Initializing from base LLM: {model_args.llm}")
         
-        # Config
-        # We can pass vis_encoder_cfg if we want to customize DINOv2, 
-        # but GromaQwenConfig defaults to facebook/dinov2-large.
-        # If model_args.perceiver is provided and is a path to DINOv2 weights, 
-        # GromaQwenModel handles loading it if it matches standard HF format, 
-        # OR we can let GromaQwenModel load from hub.
-        
-        # For now, we initialize config with num_new_token
         config = GromaQwenConfig.from_pretrained(model_args.llm, trust_remote_code=True)
-        config.num_new_token = num_new_token
+        config.num_new_token = 0  # V2: No new tokens
         
-        # Initialize Model
         model = GromaQwenModel.from_pretrained(
             model_args.llm,
             config=config,
             trust_remote_code=True
         )
-        
-        # If perceiver path is provided and valid, we could try to load it, 
-        # but GromaQwenModel loads DINOv2 internally. 
-        # If user wants to use local DINOv2, they should modify GromaQwenModel or we rely on HF cache.
-        
     else:
-        raise ValueError("Should specify either model_name_or_path or llm.")
-
-    # Resize embeddings for new tokens
-    # model.resize_token_embeddings(len(tokenizer))
+        raise ValueError("Must specify either model_name_or_path or llm")
     
-    # Initialize special token IDs in model
+    # Initialize special token IDs (verifies native tokens)
     model.init_special_token_id(tokenizer)
+    print(f"✓ Model initialized")
     
-    # Image Processor (for DINOv2)
-    # We use standard DINOv2 ImageProcessor
-    try:
-        vis_processor = AutoImageProcessor.from_pretrained("facebook/dinov2-large")
-    except:
-        # Fallback or use perceiver path if it points to something with preprocessor
-        if model_args.perceiver:
-             vis_processor = AutoImageProcessor.from_pretrained(model_args.perceiver)
-        else:
-            raise ValueError("Could not load AutoImageProcessor for facebook/dinov2-large")
-
-    # Freeze/Unfreeze logic
-    # GromaQwenModel has .vis_encoder (perceiver) and .model (llm)
+    # Freeze/Unfreeze Logic
+    print(f"\n[3] Configuring trainable parameters...")
     
-    if training_args.freeze_perceiver:
-        model.vis_encoder.requires_grad_(False)
-    
+    # Freeze LLM (always for Stage 2)
     if training_args.freeze_llm:
-        model.model.requires_grad_(False) # Qwen LLM
+        model.model.requires_grad_(False)
+        print(f"   ✓ LLM frozen (Stage 2 mode)")
+    else:
+        print(f"   ✓ LLM trainable (Stage 3 mode)")
     
+    # Freeze Image-to-Text Bridge
     if training_args.freeze_vl_bridge:
         model.img_txt_bridge.requires_grad_(False)
-        
-    # Always train new embeddings and region encoder (unless specified otherwise, but usually trained)
-    # model.region_encoder.requires_grad_(True) # Default is True
-    # model.new_input_embs.requires_grad_(True) # Default is True
-
+        print(f"   ✓ Image-to-Text Bridge frozen")
+    else:
+        print(f"   ✓ Image-to-Text Bridge trainable")
+    
+    # Region Encoder is always trainable
+    model.region_encoder.requires_grad_(True)
+    print(f"   ✓ Region Encoder (ROI Align) trainable")
+    
+    # Count trainable parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n   Total parameters: {total_params:,}")
+    print(f"   Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+    
+    # Load Processor (for image processing)
+    print(f"\n[4] Loading image processor...")
+    processor = AutoProcessor.from_pretrained(
+        tokenizer_path,
+        trust_remote_code=True
+    )
+    img_processor = processor.image_processor
+    print(f"✓ Image processor loaded")
+    
     # Build Datasets
+    print(f"\n[5] Building datasets...")
+    print(f"   Config: {data_args.dataset_config}")
+    
     train_datasets = build_multi_datasets(
         data_args.dataset_config,
         tokenizer=tokenizer,
-        img_processor=vis_processor
+        img_processor=img_processor
     )
     
+    print(f"✓ Dataset loaded with {len(train_datasets)} samples")
+    
+    # Data Collator
     data_collator = DataCollatorForHybridDataset(tokenizer)
-
+    
+    # Trainer
+    print(f"\n[6] Starting training...")
     trainer = GromaTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -210,15 +216,24 @@ def train():
         train_dataset=train_datasets,
         data_collator=data_collator
     )
-
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+    
+    # Resume from checkpoint if exists
+    checkpoint_path = pathlib.Path(training_args.output_dir)
+    if list(checkpoint_path.glob("checkpoint-*")):
+        print(f"   Resuming from checkpoint...")
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
-
+    
+    # Save model
+    print(f"\n[7] Saving model to {training_args.output_dir}")
     trainer.save_model()
     trainer.save_state()
-    vis_processor.save_pretrained(training_args.output_dir)
+    
+    # Save processor
+    processor.save_pretrained(training_args.output_dir)
+    print(f"✓ Training complete!")
+
 
 if __name__ == "__main__":
     train()

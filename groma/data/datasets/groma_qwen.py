@@ -1,94 +1,240 @@
+"""
+[GROMA-QWEN V2] Dataset processor for Qwen3VL Format
+
+This module processes datasets in both:
+- Native bbox tokens for referring: <|box_start|>, <|box_end|>, <|object_ref_start|>, <|object_ref_end|>
+- JSON format for grounding: [{"bbox_2d": [x1, y1, x2, y2], "label": "..."}]
+
+The JSON format for grounding aligns with Qwen3-VL's pre-trained grounding capabilities.
+
+Dataset Format:
+--------------
+{
+    "file_name": "image.jpg",
+    "width": 640,
+    "height": 480,
+    "boxes": [[x1, y1, x2, y2], ...],
+    "task_type": "referring" | "grounding",
+    "conversation": [
+        {"from": "human", "value": "...", "box_inds": [0, 1]},
+        {"from": "gpt", "value": "...", "box_inds": null}
+    ],
+    "messages": [...]  # Optional Qwen3VL message format
+}
+
+Referring Task Prompt:
+    "Action Recognition Task: The first region <|object_ref_start|>person<|object_ref_end|>
+    <|box_start|>(x1,y1),(x2,y2)<|box_end|> contains a PERSON..."
+
+Grounding Task Output (JSON format):
+    '[{"bbox_2d": [323, 66, 665, 622], "label": "person sitting on bench"}, ...]'
+"""
+
 import os
+import re
+import json
 import torch
 from PIL import Image
 from torchvision import transforms
 from groma.data.datasets.groma import GromaInstruct
-from groma.constants import DEFAULT_TOKENS, IGNORE_INDEX
+from groma.constants import IGNORE_INDEX
 from torchvision.ops import box_convert
-from groma.data.datasets.det_data import normalize_box_coordinates
+
+# Native Qwen3VL bbox tokens
+BOX_START = "<|box_start|>"
+BOX_END = "<|box_end|>"
+BOX_START_TOKEN_ID = 151648
+BOX_END_TOKEN_ID = 151649
+
+
+def normalize_box_coordinates(boxes, img_size):
+    """Normalize boxes from pixel coords to [0, 1] range.
+    
+    Args:
+        boxes: Tensor of boxes in cxcywh format
+        img_size: (height, width) tuple
+    
+    Returns:
+        Normalized boxes in [0, 1] range
+    """
+    h, w = img_size
+    boxes = boxes.clone()
+    boxes[:, [0, 2]] /= w  # cx, w
+    boxes[:, [1, 3]] /= h  # cy, h
+    return boxes
+
+
+def extract_boxes_from_native_format(text: str) -> list:
+    """Extract bounding boxes from native Qwen3VL format.
+    
+    Format: <|box_start|>(x1,y1),(x2,y2)<|box_end|>
+    
+    Args:
+        text: Text containing native bbox format
+    
+    Returns:
+        List of [x1, y1, x2, y2] boxes in [0, 1000] range
+    """
+    pattern = r'<\|box_start\|>\((\d+),(\d+)\),\((\d+),(\d+)\)<\|box_end\|>'
+    matches = re.findall(pattern, text)
+    
+    boxes = []
+    for match in matches:
+        x1, y1, x2, y2 = int(match[0]), int(match[1]), int(match[2]), int(match[3])
+        boxes.append([x1, y1, x2, y2])
+    
+    return boxes
+
+
+def extract_boxes_from_json_format(text: str) -> list:
+    """Extract bounding boxes from JSON format (Qwen3-VL grounding style).
+    
+    Format: [{"bbox_2d": [x1, y1, x2, y2], "label": "..."}, ...]
+    
+    Args:
+        text: Text containing JSON bbox format
+    
+    Returns:
+        List of [x1, y1, x2, y2] boxes in [0, 1000] range
+    """
+    boxes = []
+    
+    try:
+        # Clean markdown fencing if present
+        clean_text = text.strip()
+        if "```json" in clean_text:
+            clean_text = clean_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in clean_text:
+            clean_text = clean_text.split("```")[1].split("```")[0].strip()
+        
+        # Parse JSON
+        data = json.loads(clean_text)
+        
+        # Handle both single object and array
+        if not isinstance(data, list):
+            data = [data]
+        
+        for item in data:
+            if "bbox_2d" in item:
+                bbox = item["bbox_2d"]
+                if len(bbox) == 4:
+                    boxes.append([int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        # If JSON parsing fails, return empty list
+        pass
+    
+    return boxes
 
 
 class GromaInstructQwen(GromaInstruct):
-    def __init__(self, ann_file, img_prefix, tokenizer, img_processor, conv_temp='default'):
-        """
-        Initialize GromaInstructQwen dataset.
-        
-        Note: conv_temp parameter is kept for compatibility but ignored.
-        We use Qwen3VL template format instead.
-        """
-        # Call parent __init__ but we'll override preprocess
-        super().__init__(ann_file, img_prefix, tokenizer, img_processor, conv_temp)
-        
-        # Verify tokenizer has apply_chat_template method (required for Qwen3VL)
-        if not hasattr(self.tokenizer, 'apply_chat_template'):
-            raise ValueError(
-                "Tokenizer must have apply_chat_template method for Qwen3VL template. "
-                "Please ensure you're using Qwen3-VL tokenizer from Groma/checkpoints/Qwen3-VL-8B-Instruct"
-            )
-        
-        # Get EOS token ID (should be 151645 for Qwen3-VL)
-        self.eos_token_id = getattr(self.tokenizer, 'eos_token_id', None)
-        if self.eos_token_id is None:
-            # Try to find <|im_end|> token
-            self.eos_token_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-            if self.eos_token_id == self.tokenizer.unk_token_id:
-                raise ValueError("Could not find EOS token (<|im_end|>) in tokenizer vocabulary")
-        
-        # Get <|im_start|> and <|im_end|> token IDs for masking
-        self.im_start_token_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
-        self.im_end_token_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-        
-        if self.im_start_token_id == self.tokenizer.unk_token_id:
-            raise ValueError("Could not find <|im_start|> token in tokenizer vocabulary")
-        if self.im_end_token_id == self.tokenizer.unk_token_id:
-            raise ValueError("Could not find <|im_end|> token in tokenizer vocabulary")
+    """Dataset processor for Groma with native Qwen3VL format.
     
-    def _convert_conversation_to_messages(self, conversation, bboxes):
-        """
-        Convert conversation format to Qwen3VL message format.
+    Key Features:
+    - Uses native Qwen3VL bbox tokens
+    - No custom token handling
+    - Extracts refer_boxes from native format in prompts
+    - Supports task_filter to filter by task type ('referring' or 'grounding')
+    """
+    
+    def __init__(self, ann_file, img_prefix, tokenizer, img_processor, conv_temp='default', task_filter=None):
+        """Initialize GromaInstructQwen dataset.
         
         Args:
-            conversation: List of dicts with "from" and "value" keys
-            bboxes: Normalized bounding boxes tensor
-        
-        Returns:
-            List of message dicts in Qwen3VL format
+            ann_file: Path to annotation JSON file
+            img_prefix: Path prefix for images
+            tokenizer: Tokenizer with Qwen3VL tokens
+            img_processor: Image processor
+            conv_temp: Conversation template (kept for compatibility, ignored)
+            task_filter: Optional filter - 'referring', 'grounding', or None for all
         """
-        # System message
-        system_message = (
-            f"Here is an image with region crops from it. "
-            f"Image: {DEFAULT_TOKENS['image']}. "
-            f"Regions: {DEFAULT_TOKENS['region']}."
-        )
+        super().__init__(ann_file, img_prefix, tokenizer, img_processor, conv_temp)
+        
+        # Apply task filter if specified
+        self.task_filter = task_filter
+        if task_filter is not None:
+            original_count = len(self.meta_data)
+            self.meta_data = [
+                item for item in self.meta_data 
+                if item.get('task_type', 'referring') == task_filter
+            ]
+            filtered_count = len(self.meta_data)
+            print(f"[GromaInstructQwen V2] Task filter '{task_filter}': {original_count} -> {filtered_count} samples")
+        
+        # Verify tokenizer has apply_chat_template method
+        if not hasattr(self.tokenizer, 'apply_chat_template'):
+            raise ValueError(
+                "Tokenizer must have apply_chat_template method for Qwen3VL template."
+            )
+        
+        # Get native Qwen3VL token IDs
+        self.box_start_token_id = self.tokenizer.convert_tokens_to_ids(BOX_START)
+        self.box_end_token_id = self.tokenizer.convert_tokens_to_ids(BOX_END)
+        
+        if self.box_start_token_id == self.tokenizer.unk_token_id:
+            raise ValueError(f"Native token {BOX_START} not found in tokenizer")
+        if self.box_end_token_id == self.tokenizer.unk_token_id:
+            raise ValueError(f"Native token {BOX_END} not found in tokenizer")
+        
+        # Get EOS token ID
+        self.im_start_token_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
+        self.im_end_token_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        self.eos_token_id = self.im_end_token_id
+        
+        print(f"[GromaInstructQwen V2] Initialized with native Qwen3VL tokens:")
+        print(f"  - {BOX_START}: {self.box_start_token_id}")
+        print(f"  - {BOX_END}: {self.box_end_token_id}")
+        print(f"  - Total samples: {len(self.meta_data)}")
+    
+    def _convert_to_messages(self, data_item):
+        """Convert data item to Qwen3VL message format.
+        
+        Uses pre-converted messages if available, otherwise converts conversation.
+        """
+        if 'messages' in data_item and data_item['messages']:
+            return data_item['messages']
+        
+        conversation = data_item.get('conversation', [])
+        if len(conversation) < 2:
+            return None
+        
+        task_type = data_item.get('task_type', 'referring')
+        
+        # System message based on task type
+        if task_type == 'referring':
+            system_content = (
+                "You are an expert at understanding human-object interactions in images. "
+                "You will be given an image with two regions marked by bounding boxes. "
+                "Describe the action being performed."
+            )
+        else:
+            # JSON format grounding system prompt (aligned with Qwen3-VL)
+            # Uses simplified labels to avoid confusion between person and object entries
+            system_content = (
+                "You are an expert at locating human-object interactions in images. "
+                "When asked to locate people performing actions with objects, find ALL matching "
+                "person-object pairs and output their bounding box coordinates in JSON format. "
+                "Use bbox_2d as [x1, y1, x2, y2] coordinates (0-1000 scale). "
+                "Label person boxes as 'person' and object boxes with the object category name. "
+                "Output pairs in alternating order: [person, object, person, object, ...]."
+            )
         
         messages = [
-            {
-                "role": "system",
-                "content": system_message
-            }
+            {"role": "system", "content": system_content}
         ]
-        
-        # Process conversation pairs
-        assert len(conversation) % 2 == 0, "Conversation must have even number of turns"
         
         for i, conv in enumerate(conversation):
             role = conv.get('from', '').lower()
             value = conv.get('value', '')
-            box_inds = conv.get('box_inds', None)
             
             if role == 'human':
-                # User message: add [grounding] prefix and handle image placeholder
-                text_content = DEFAULT_TOKENS['ground'] + value
-                user_content = [
-                    {"type": "image", "image": "placeholder"},  # Actual image loaded in __getitem__
-                    {"type": "text", "text": text_content}
-                ]
                 messages.append({
                     "role": "user",
-                    "content": user_content
+                    "content": [
+                        {"type": "image", "image": "placeholder"},
+                        {"type": "text", "text": value}
+                    ]
                 })
             elif role == 'gpt':
-                # Assistant message: preserve Groma tokens and coordinates
                 messages.append({
                     "role": "assistant",
                     "content": value
@@ -97,63 +243,54 @@ class GromaInstructQwen(GromaInstruct):
         return messages
     
     def preprocess(self, data_item):
+        """Preprocess data item using native Qwen3VL format.
+        
+        Returns:
+            dict with input_ids, labels, refer_boxes, ground_boxes
         """
-        Preprocess data item using Qwen3VL template format.
+        img_w = data_item.get('width', 640)
+        img_h = data_item.get('height', 480)
+        task_type = data_item.get('task_type', 'referring')
         
-        Uses apply_chat_template() to convert messages to tokenized format,
-        then applies proper masking for training (only assistant responses).
-        """
-        # 1. Load and normalize boxes
-        bboxes = data_item['boxes']
-        bboxes = torch.tensor(bboxes)
-        bboxes = box_convert(bboxes, 'xywh', 'cxcywh')
-        img_w = data_item['width']
-        img_h = data_item['height']
-        bboxes = normalize_box_coordinates(bboxes, (img_h, img_w))
+        # Get messages
+        messages = self._convert_to_messages(data_item)
+        if messages is None:
+            return None
         
-        # 2. Get messages (use pre-converted if available, otherwise convert)
-        if 'messages' in data_item:
-            # Use pre-converted Qwen3VL format from regenerated dataset
-            messages = data_item['messages']
-        else:
-            # Convert from conversation format (backward compatibility)
-            conversation = data_item['conversation']
-            messages = self._convert_conversation_to_messages(conversation, bboxes)
-        
-        # 3. Extract boxes for refer_boxes and ground_boxes
+        # Extract refer_boxes from user message (for referring task)
         refer_boxes_list = []
         ground_boxes_list = []
         
-        # Get conversation for box extraction (use original conversation format)
         conversation = data_item.get('conversation', [])
         for i, conv in enumerate(conversation):
-            box_inds = conv.get('box_inds', None)
-            if box_inds is not None and len(box_inds) > 0:
-                if i % 2 == 0:
-                    # Human query: referring boxes
-                    refer_boxes_list.extend([bboxes[idx] for idx in box_inds])
-                else:
-                    # Assistant response: grounding boxes
-                    ground_boxes_list.extend([bboxes[idx] for idx in box_inds])
+            value = conv.get('value', '')
+            
+            if i % 2 == 0:  # Human turn
+                # Boxes in human turn are refer_boxes (for referring task)
+                # Always use native format for human prompts (referring)
+                boxes_in_text = extract_boxes_from_native_format(value)
+                refer_boxes_list.extend(boxes_in_text)
+            else:  # GPT turn
+                # Boxes in GPT turn are ground_boxes (for grounding task)
+                # Try JSON format first (for grounding), fall back to native format
+                boxes_in_text = extract_boxes_from_json_format(value)
+                if not boxes_in_text:
+                    # Fall back to native format for backward compatibility
+                    boxes_in_text = extract_boxes_from_native_format(value)
+                ground_boxes_list.extend(boxes_in_text)
         
-        # Stack boxes
-        if len(ground_boxes_list) > 0:
-            ground_boxes = torch.stack(ground_boxes_list)
-        else:
-            ground_boxes = torch.empty(0, 4)
-        
+        # Convert to tensors in [0, 1000] format (already in this format from native)
         if len(refer_boxes_list) > 0:
-            refer_boxes = torch.stack(refer_boxes_list)
+            refer_boxes = torch.tensor(refer_boxes_list, dtype=torch.float32)
         else:
             refer_boxes = torch.empty(0, 4)
         
-        # 4. Apply Qwen3VL chat template to tokenize
-        # Note: We need to replace image placeholder with actual image for tokenization
-        # But for now, we'll use a dummy image since the actual image is loaded in __getitem__
-        # The template will handle the image token placement
+        if len(ground_boxes_list) > 0:
+            ground_boxes = torch.tensor(ground_boxes_list, dtype=torch.float32)
+        else:
+            ground_boxes = torch.empty(0, 4)
         
-        # Create a copy of messages with actual image (will be replaced in __getitem__)
-        # For tokenization, we use placeholder - the actual image embedding will be injected later
+        # Tokenize using apply_chat_template
         tokenized = self.tokenizer.apply_chat_template(
             messages,
             tokenize=True,
@@ -164,179 +301,84 @@ class GromaInstructQwen(GromaInstruct):
         
         input_ids = tokenized['input_ids'][0]
         
-        # Truncate sequences that exceed model's max position embeddings (2048 for Qwen3-VL)
-        # Strategy: Preserve system message (contains <image>, <region> tokens) + assistant response (training target)
-        # Truncate middle portions (user messages) if needed
+        # Truncate if needed
         max_seq_length = 2048
         if len(input_ids) > max_seq_length:
-            # Find system message end and assistant start
-            im_start_positions = (input_ids == self.im_start_token_id).nonzero(as_tuple=True)[0]
-            im_end_positions = (input_ids == self.im_end_token_id).nonzero(as_tuple=True)[0]
-            
-            if len(im_start_positions) >= 3 and len(im_end_positions) >= 2:
-                # System message typically ends at first <|im_end|>
-                system_end = im_end_positions[0].item() + 1  # Include the <|im_end|> token
-                # Assistant starts at last <|im_start|>
-                assistant_start = im_start_positions[-1].item()
-                
-                system_size = system_end
-                assistant_size = len(input_ids) - assistant_start
-                remaining = max_seq_length - system_size - assistant_size
-                
-                if remaining >= 0:
-                    # Can fit both: system + middle portion + assistant
-                    parts = [input_ids[:system_end]]  # System message
-                    if remaining > 0:
-                        parts.append(input_ids[assistant_start - remaining:assistant_start])  # Middle portion
-                    parts.append(input_ids[assistant_start:])  # Assistant response
-                    input_ids = torch.cat(parts)
-                else:
-                    # Can't fit both, prioritize assistant response (training target)
-                    # Keep: last portion of system + full assistant
-                    system_portion = max(50, max_seq_length - assistant_size)  # Keep at least 50 tokens from system
-                    input_ids = torch.cat([
-                        input_ids[:system_portion],
-                        input_ids[assistant_start:]
-                    ])
-                    # Final truncation if still too long
-                    if len(input_ids) > max_seq_length:
-                        input_ids = input_ids[-max_seq_length:]
-            else:
-                # Fallback: keep last max_seq_length tokens (preserves assistant response)
-                input_ids = input_ids[-max_seq_length:]
+            # Keep last portion to preserve assistant response
+            input_ids = input_ids[-max_seq_length:]
         
-        # 5. Mask targets: only train on assistant responses
-        # Qwen3VL format: <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n...<|im_end|>\n
-        # We want to mask everything except assistant responses
-        
+        # Create labels (mask everything except assistant response)
         targets = input_ids.clone()
         
-        # Find all <|im_start|> positions
+        # Find <|im_start|> positions
         im_start_positions = (input_ids == self.im_start_token_id).nonzero(as_tuple=True)[0]
-        im_end_positions = (input_ids == self.im_end_token_id).nonzero(as_tuple=True)[0]
         
-        # Strategy: Find the last <|im_start|> (should be for assistant)
-        # Mask everything before it, then find where assistant content actually starts
-        # (after "<|im_start|>assistant\n")
-        
-        if len(im_start_positions) >= 3:  # Should have system, user, assistant
+        if len(im_start_positions) >= 3:
             # Last <|im_start|> should be assistant
-            assistant_im_start_idx = im_start_positions[-1].item()
+            assistant_start = im_start_positions[-1].item()
             
-            # Mask everything before assistant <|im_start|>
-            targets[:assistant_im_start_idx] = IGNORE_INDEX
+            # Mask everything before assistant
+            targets[:assistant_start] = IGNORE_INDEX
             
-            # Find where assistant content starts (after "<|im_start|>assistant\n")
-            # We need to skip: <|im_start|> (1 token) + "assistant" (multiple tokens) + \n (1 token)
-            # Approximate: decode a small portion to find where content starts
-            # For efficiency, use a fixed offset (typically "assistant" + "\n" is ~3-5 tokens)
-            # More robust: search for newline token after assistant_im_start_idx
-            content_start = assistant_im_start_idx + 1  # Skip <|im_start|>
-            
-            # Try to find newline token (token ID 198 in many tokenizers) after assistant role
-            # Look ahead up to 10 tokens
-            for offset in range(1, min(10, len(input_ids) - assistant_im_start_idx)):
-                idx = assistant_im_start_idx + offset
-                # Check if this looks like end of role name (newline or space)
-                # Token 198 is often newline, but let's be more general
-                # Actually, let's just use a reasonable offset
-                if offset >= 5:  # Usually "assistant\n" is ~5 tokens
-                    content_start = idx + 1
-                    break
-            
-            # Mask the role name part
-            if content_start < len(targets):
-                targets[assistant_im_start_idx:content_start] = IGNORE_INDEX
-            
-            # Everything from content_start onwards should be kept (including final <|im_end|>)
+            # Also mask the role part (assistant\n) - approximately 5 tokens
+            content_start = min(assistant_start + 5, len(targets))
+            targets[assistant_start:content_start] = IGNORE_INDEX
         else:
-            # Fallback: if structure is unexpected, mask everything before last <|im_end|>
-            if len(im_end_positions) >= 2:
-                # Keep only the last assistant response (between second-to-last and last <|im_end|>)
-                last_eos_before_assistant = im_end_positions[-2].item()
-                targets[:last_eos_before_assistant + 1] = IGNORE_INDEX
-            else:
-                # Very fallback: mask everything
-                targets[:] = IGNORE_INDEX
+            # Fallback: mask everything
+            targets[:] = IGNORE_INDEX
         
-        # 6. Return data dict
-        data_dict = dict(
+        return dict(
             input_ids=input_ids,
             labels=targets,
-            ground_boxes=ground_boxes,
             refer_boxes=refer_boxes,
-            source='walle_data'
+            ground_boxes=ground_boxes,
+            task_type=task_type,
+            source='groma_qwen_v2'
         )
-        return data_dict
     
     def __getitem__(self, i) -> dict:
-        """
-        Get item with image processing.
-        Override to handle image in messages for Qwen3VL template.
+        """Get item with image processing.
+        
+        Returns dict with:
+        - input_ids: Tokenized input
+        - labels: Training labels
+        - image: Processed image for Qwen3VL
+        - refer_boxes: Boxes for referring task (in [0, 1000] format)
+        - ground_boxes: Boxes for grounding task output
         """
         data_item = self.meta_data[i]
         image_file = data_item['file_name']
+        img_w = data_item.get('width', 640)
+        img_h = data_item.get('height', 480)
         
-        # Load original image (before resize) for region cropping
+        # Load original image
         original_image = Image.open(os.path.join(self.image_folder, image_file)).convert('RGB')
-        img_w = data_item['width']
-        img_h = data_item['height']
         
-        # Resize image for Qwen3VL (448x448)
+        # Resize for Qwen3VL (448x448)
         image_resized = original_image.resize((448, 448))
         image = self.img_processor.preprocess(image_resized, return_tensors='pt')['pixel_values'][0]
         
-        # Preprocess to get tokenized input (includes refer_boxes and ground_boxes)
+        # Preprocess to get tokenized input
         data_dict = self.preprocess(data_item)
+        if data_dict is None:
+            # Return empty dict for invalid samples
+            return {
+                'input_ids': torch.tensor([]),
+                'labels': torch.tensor([]),
+                'image': image,
+                'refer_boxes': torch.empty(0, 4),
+                'ground_boxes': torch.empty(0, 4),
+            }
+        
         data_dict['image'] = image
         
-        # Prepare region_images from refer_boxes for DINOv2 processing
-        # refer_boxes are in normalized cxcywh format (0-1), need to convert to xyxy pixel coordinates
-        refer_boxes = data_dict.get('refer_boxes', torch.empty(0, 4))
-        if refer_boxes.numel() > 0:
-            # Convert refer_boxes from normalized cxcywh to xyxy pixel coordinates
-            # refer_boxes shape: (N, 4) in normalized cxcywh format
-            refer_boxes_cxcywh = refer_boxes.clone()
-            
-            # Denormalize: multiply by image dimensions
-            refer_boxes_cxcywh[:, [0, 2]] *= img_w  # cx, w
-            refer_boxes_cxcywh[:, [1, 3]] *= img_h  # cy, h
-            
-            # Convert cxcywh to xyxy
-            refer_boxes_xyxy = box_convert(refer_boxes_cxcywh, 'cxcywh', 'xyxy')
-            
-            # Crop regions from original image
-            region_images_list = []
-            for bbox_xyxy in refer_boxes_xyxy:
-                x1, y1, x2, y2 = bbox_xyxy.tolist()
-                # Clip to image bounds
-                x1 = max(0, min(int(x1), img_w))
-                y1 = max(0, min(int(y1), img_h))
-                x2 = max(x1, min(int(x2), img_w))
-                y2 = max(y1, min(int(y2), img_h))
-                
-                # Crop and resize to 224x224 for DINOv2
-                if x2 > x1 and y2 > y1:
-                    region = original_image.crop((x1, y1, x2, y2))
-                    region = region.resize((224, 224), Image.Resampling.LANCZOS)
-                    # Convert to tensor (C, H, W) in [0, 1] range
-                    transform = transforms.ToTensor()
-                    region_tensor = transform(region)
-                    region_images_list.append(region_tensor)
-            
-            if len(region_images_list) > 0:
-                # Stack into batch: (N, C, H, W)
-                region_images = torch.stack(region_images_list)
-            else:
-                # No valid regions - return None (matches inference behavior)
-                # This ensures training matches inference: both use None when no regions
-                region_images = None
-        else:
-            # No refer boxes - return None (matches inference behavior)
-            # For grounding tasks, refer_boxes is empty, so region_images should be None
-            # This prevents training/inference mismatch
-            region_images = None
-        
-        data_dict['region_images'] = region_images
+        # Note: In V2, we don't create region_images here
+        # The model extracts features from Qwen3VL vision encoder directly
+        # refer_boxes are already in [0, 1000] format from the native format
         
         return data_dict
+
+
+class GromaInstructQwenNative(GromaInstructQwen):
+    """Alias for backward compatibility."""
+    pass

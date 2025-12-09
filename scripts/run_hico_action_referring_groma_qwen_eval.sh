@@ -17,7 +17,7 @@
 #   # With debugging flags
 #   VERBOSE=1 bash scripts/run_hico_action_referring_groma_qwen_eval.sh 0
 #   MAX_IMAGES=10 bash scripts/run_hico_action_referring_groma_qwen_eval.sh 0
-#   VERBOSE=1 MAX_IMAGES=10 bash scripts/run_hico_action_referring_groma_qwen_eval.sh 5
+#   VERBOSE=1 MAX_IMAGES=10 bash scripts/run_hico_action_referring_groma_qwen_eval.sh 4
 #
 #   # With W&B logging
 #   WANDB=1 VERBOSE=1 bash scripts/run_hico_action_referring_groma_qwen_eval.sh 5
@@ -46,11 +46,11 @@ set -e  # Exit on error
 
 # Configuration with defaults
 GPU_ID="${1:-0}"
-MODEL_PATH="${2:-checkpoints/groma-qwen-stage3-referring-only-24-nov-fixed}"
+MODEL_PATH="${2:-checkpoints/groma-qwen-v2-stage2-combined-json-new}"
 HICO_ROOT="../data/hico_20160224_det"
 BENCHMARK_ANN="${3:-groma_data/benchmarks/hico_action_referring_test.json}"
 IMAGES_DIR="${4:-${HICO_ROOT}/images/test2015}"
-OUTPUT_DIR="${5:-results-redo-groma/hico_action_referring_groma_qwen}"
+OUTPUT_DIR="${5:-results-groma-qwen/hico_action_referring_groma_qwen_combined_json_new}"
 
 # Set GPU
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
