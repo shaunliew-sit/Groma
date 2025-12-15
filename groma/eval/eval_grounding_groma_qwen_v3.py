@@ -1,21 +1,20 @@
 """
-SWIG-HOI Grounding Evaluation Script for Groma Qwen3VL (Multi-Pair Format)
+HICO-DET / SWIG-HOI Grounding Evaluation Script for Groma Qwen V2/V3 (JSON Format)
 
-Evaluates Groma Qwen3VL grounding performance on SWIG-HOI dataset with multi-pair support.
-Supports person-person interactions.
+Evaluates Groma Qwen V2 or V3 (with interaction token) grounding performance 
+using JSON bbox format aligned with Qwen3-VL.
 
-Key Differences from Qwen3VL Evaluation:
-- Uses GromaQwenModel instead of Qwen3VLForConditionalGeneration
-- Parses Groma region tokens: <roi> (x1,y1),(x2,y2) </roi> instead of JSON
-- Uses region_images parameter for DINOv2 region features
-- Same metrics: AR (Average Recall) at multiple IoU thresholds with size-specific metrics
+Key Features:
+- Auto-detects V2 vs V3 models from config.json
+- Uses JSON format for grounding: [{"bbox_2d": [x1, y1, x2, y2], "label": "..."}]
+- Aligns with Qwen3-VL's pre-trained grounding capabilities
+- Supports multi-pair detection in single image
 
-Task: Given "[grounding] Identify the following person and objects in the image: person {action} {object} and the {object}",
-      predict bounding boxes for ALL person-object pairs performing that action.
+Note: For grounding tasks, there are no input bounding boxes (the model predicts them),
+so the interaction token feature doesn't apply. V3 models work the same as V2 for grounding.
 
-Output Format (from Groma Qwen):
-<p>person</p><roi> (x1,y1),(x2,y2) </roi><p>object</p><roi> (x1,y1),(x2,y2) </roi>
-<p>person</p><roi> (x1,y1),(x2,y2) </roi><p>object</p><roi> (x1,y1),(x2,y2) </roi>
+Task: Given "Locate every person who is {action} {object} and the {object} they interact with...",
+      predict bounding boxes for ALL person-object pairs performing that action in JSON format.
 
 Metrics: Pair-level Precision, Recall, F1 @ IoU thresholds (0.5 to 0.95)
 Size-specific metrics: ARs (small), ARm (medium), ARl (large)
@@ -34,12 +33,14 @@ import numpy as np
 
 from transformers import AutoProcessor, AutoConfig, AutoModelForCausalLM
 from groma.model.groma_qwen import GromaQwenModel, GromaQwenConfig
+from groma.model.groma_qwen_interaction import GromaQwenInteractionModel, GromaQwenInteractionConfig
 from groma.utils import disable_torch_init
-from groma.constants import DEFAULT_TOKENS, REGION_IDX_TOKENS
 
-# Register custom model
+# Register custom models
 AutoConfig.register("groma_qwen", GromaQwenConfig)
 AutoModelForCausalLM.register(GromaQwenConfig, GromaQwenModel)
+AutoConfig.register("groma_qwen_interaction", GromaQwenInteractionConfig)
+AutoModelForCausalLM.register(GromaQwenInteractionConfig, GromaQwenInteractionModel)
 
 # Weights & Biases for experiment tracking
 try:
@@ -47,6 +48,166 @@ try:
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
+
+# Native Qwen3VL bbox tokens
+BOX_START = "<|box_start|>"
+BOX_END = "<|box_end|>"
+OBJECT_REF_START = "<|object_ref_start|>"
+OBJECT_REF_END = "<|object_ref_end|>"
+
+
+def visualize_grounding_result(
+    image: Image.Image,
+    gt_pairs: list,
+    pred_pairs: list,
+    action: str,
+    object_category: str,
+    output_path: str,
+    matched_indices: set = None
+):
+    """
+    Visualize grounding results with GT and predicted boxes.
+    
+    Args:
+        image: PIL Image
+        gt_pairs: List of GT pairs, each pair is {'person_box': [x1,y1,x2,y2], 'object_box': [x1,y1,x2,y2]}
+        pred_pairs: List of predicted pairs (same format)
+        action: Action name
+        object_category: Object category name
+        output_path: Where to save the visualization
+        matched_indices: Set of GT indices that were matched (for color coding)
+    """
+    # Create a copy for drawing
+    viz_img = image.copy()
+    draw = ImageDraw.Draw(viz_img)
+    
+    # Try to load a font
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
+    except:
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 14)
+            font_small = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 11)
+        except:
+            font = ImageFont.load_default()
+            font_small = font
+    
+    img_w, img_h = image.size
+    matched_indices = matched_indices or set()
+    
+    # Colors
+    GT_PERSON_COLOR = "#00AA00"  # Green for GT person
+    GT_OBJECT_COLOR = "#00CC00"  # Light green for GT object
+    GT_MATCHED_PERSON = "#0066CC"  # Blue for matched GT
+    GT_MATCHED_OBJECT = "#0099FF"  # Light blue for matched GT
+    PRED_PERSON_COLOR = "#FF4444"  # Red for predicted person
+    PRED_OBJECT_COLOR = "#FF8800"  # Orange for predicted object
+    
+    # Draw GT pairs first (in background)
+    for i, gt_pair in enumerate(gt_pairs):
+        person_box = gt_pair['person_box']
+        object_box = gt_pair['object_box']
+        
+        # Choose color based on whether it was matched
+        if i in matched_indices:
+            person_color = GT_MATCHED_PERSON
+            object_color = GT_MATCHED_OBJECT
+            label_prefix = f"GT{i+1}✓"
+        else:
+            person_color = GT_PERSON_COLOR
+            object_color = GT_OBJECT_COLOR
+            label_prefix = f"GT{i+1}"
+        
+        # Draw person box
+        draw.rectangle(person_box, outline=person_color, width=3)
+        # Draw label
+        label = f"{label_prefix}-P"
+        try:
+            bbox = draw.textbbox((person_box[0], max(0, person_box[1] - 18)), label, font=font_small)
+            draw.rectangle(bbox, fill=person_color)
+            draw.text((person_box[0], max(0, person_box[1] - 18)), label, fill="white", font=font_small)
+        except:
+            draw.text((person_box[0], max(0, person_box[1] - 15)), label, fill=person_color, font=font_small)
+        
+        # Draw object box
+        draw.rectangle(object_box, outline=object_color, width=3)
+        # Draw label
+        label = f"{label_prefix}-O"
+        try:
+            bbox = draw.textbbox((object_box[0], max(0, object_box[1] - 18)), label, font=font_small)
+            draw.rectangle(bbox, fill=object_color)
+            draw.text((object_box[0], max(0, object_box[1] - 18)), label, fill="white", font=font_small)
+        except:
+            draw.text((object_box[0], max(0, object_box[1] - 15)), label, fill=object_color, font=font_small)
+        
+        # Draw connection line
+        person_center = ((person_box[0] + person_box[2]) / 2, (person_box[1] + person_box[3]) / 2)
+        object_center = ((object_box[0] + object_box[2]) / 2, (object_box[1] + object_box[3]) / 2)
+        draw.line([person_center, object_center], fill=person_color, width=2)
+    
+    # Draw predicted pairs on top
+    for i, pred_pair in enumerate(pred_pairs):
+        person_box = pred_pair['person_box']
+        object_box = pred_pair['object_box']
+        
+        # Draw person box (dashed effect using multiple rectangles)
+        draw.rectangle(person_box, outline=PRED_PERSON_COLOR, width=2)
+        # Inner rectangle for double-line effect
+        inner_box = [person_box[0]+2, person_box[1]+2, person_box[2]-2, person_box[3]-2]
+        if inner_box[2] > inner_box[0] and inner_box[3] > inner_box[1]:
+            draw.rectangle(inner_box, outline=PRED_PERSON_COLOR, width=1)
+        
+        # Draw label
+        label = f"Pred{i+1}-P"
+        label_y = min(img_h - 20, person_box[3] + 2)
+        try:
+            bbox = draw.textbbox((person_box[0], label_y), label, font=font_small)
+            draw.rectangle(bbox, fill=PRED_PERSON_COLOR)
+            draw.text((person_box[0], label_y), label, fill="white", font=font_small)
+        except:
+            draw.text((person_box[0], label_y), label, fill=PRED_PERSON_COLOR, font=font_small)
+        
+        # Draw object box
+        draw.rectangle(object_box, outline=PRED_OBJECT_COLOR, width=2)
+        inner_box = [object_box[0]+2, object_box[1]+2, object_box[2]-2, object_box[3]-2]
+        if inner_box[2] > inner_box[0] and inner_box[3] > inner_box[1]:
+            draw.rectangle(inner_box, outline=PRED_OBJECT_COLOR, width=1)
+        
+        # Draw label
+        label = f"Pred{i+1}-O"
+        label_y = min(img_h - 20, object_box[3] + 2)
+        try:
+            bbox = draw.textbbox((object_box[0], label_y), label, font=font_small)
+            draw.rectangle(bbox, fill=PRED_OBJECT_COLOR)
+            draw.text((object_box[0], label_y), label, fill="white", font=font_small)
+        except:
+            draw.text((object_box[0], label_y), label, fill=PRED_OBJECT_COLOR, font=font_small)
+        
+        # Draw connection line
+        person_center = ((person_box[0] + person_box[2]) / 2, (person_box[1] + person_box[3]) / 2)
+        object_center = ((object_box[0] + object_box[2]) / 2, (object_box[1] + object_box[3]) / 2)
+        draw.line([person_center, object_center], fill=PRED_PERSON_COLOR, width=2)
+    
+    # Add title/legend at the top
+    title = f"Action: {action} | Object: {object_category}"
+    legend = f"GT pairs: {len(gt_pairs)} (green/blue=matched) | Pred pairs: {len(pred_pairs)} (red/orange)"
+    
+    # Draw title background
+    try:
+        title_bbox = draw.textbbox((10, 5), title, font=font)
+        draw.rectangle([5, 2, title_bbox[2] + 5, title_bbox[3] + 3], fill="white", outline="black")
+        draw.text((10, 5), title, fill="black", font=font)
+        
+        legend_bbox = draw.textbbox((10, title_bbox[3] + 5), legend, font=font_small)
+        draw.rectangle([5, title_bbox[3] + 2, legend_bbox[2] + 5, legend_bbox[3] + 3], fill="white", outline="black")
+        draw.text((10, title_bbox[3] + 5), legend, fill="black", font=font_small)
+    except:
+        draw.text((10, 5), title, fill="black", font=font)
+        draw.text((10, 25), legend, fill="black", font=font_small)
+    
+    # Save visualization
+    viz_img.save(output_path, "JPEG", quality=90)
 
 
 def calculate_iou(box1, box2):
@@ -95,13 +256,17 @@ def categorize_pair_by_size(gt_pair, area_small=1024, area_medium=9216):
         return 'large'
 
 
-def parse_groma_qwen_grounding_response(response_text, img_shape):
+def parse_grounding_response(response_text, img_shape):
     """
-    Parse Groma Qwen grounding response to extract person-object pairs.
+    Parse grounding response to extract person-object pairs.
+    Supports both JSON format and legacy native Qwen3VL bbox format.
 
     Args:
-        response_text: Generated text like:
-            "<p>person</p><roi> (0,31),(478,998) </roi><p>object</p><roi> (355,228),(767,810) </roi>"
+        response_text: Generated text in JSON format like:
+            '[{"bbox_2d": [320, 306, 359, 349], "label": "person sitting on bench"}, 
+              {"bbox_2d": [148, 345, 376, 414], "label": "bench"}]'
+            Or legacy native format:
+            "<|object_ref_start|>person<|object_ref_end|><|box_start|>(320,306),(359,349)<|box_end|>..."
         img_shape: Tuple of (height, width)
 
     Returns:
@@ -111,22 +276,101 @@ def parse_groma_qwen_grounding_response(response_text, img_shape):
     pairs = []
     h, w = img_shape
 
-    # Pattern to match: <roi> (x1,y1),(x2,y2) </roi>
-    roi_pattern = r'<roi>\s*\((\d+),(\d+)\),\((\d+),(\d+)\)\s*</roi>'
+    # Try JSON format first (primary format)
+    json_pairs = _parse_json_format(response_text, h, w)
+    if json_pairs:
+        return json_pairs
     
-    # Extract person and object boxes in pairs
-    # Format: <p>person</p><roi>...</roi><p>object</p><roi>...</roi>
-    # We need to find pairs of consecutive roi tags
-    roi_matches = list(re.finditer(roi_pattern, response_text))
+    # Fall back to native format for backward compatibility
+    return _parse_native_format(response_text, h, w)
+
+
+def _parse_json_format(response_text, h, w):
+    """Parse JSON format grounding response."""
+    pairs = []
     
-    # Group into pairs (person, object) - SWIG can have person-person pairs too
-    for i in range(0, len(roi_matches), 2):
-        if i + 1 < len(roi_matches):
-            # First match is person/subject, second is object/person
-            person_match = roi_matches[i]
-            object_match = roi_matches[i + 1]
+    try:
+        # Clean markdown fencing if present
+        clean_text = response_text.strip()
+        if "```json" in clean_text:
+            clean_text = clean_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in clean_text:
+            # Handle case where it's just ```...```
+            parts = clean_text.split("```")
+            if len(parts) >= 2:
+                clean_text = parts[1].strip()
+        
+        # Try to find JSON array in the text
+        # Sometimes the model outputs text before/after the JSON
+        json_start = clean_text.find('[')
+        json_end = clean_text.rfind(']')
+        if json_start != -1 and json_end != -1:
+            clean_text = clean_text[json_start:json_end + 1]
+        
+        # Parse JSON
+        data = json.loads(clean_text)
+        
+        # Handle both single object and array
+        if not isinstance(data, list):
+            data = [data]
+        
+        if len(data) == 0:
+            return []
+        
+        # Group consecutive pairs: [person1, object1, person2, object2, ...]
+        for i in range(0, len(data), 2):
+            if i + 1 < len(data):
+                person_item = data[i]
+                object_item = data[i + 1]
+                
+                if "bbox_2d" in person_item and "bbox_2d" in object_item:
+                    person_bbox = person_item["bbox_2d"]
+                    object_bbox = object_item["bbox_2d"]
+                    
+                    # Convert from [0, 1000] to pixel coordinates
+                    person_box = [
+                        (person_bbox[0] / 1000.0) * w,
+                        (person_bbox[1] / 1000.0) * h,
+                        (person_bbox[2] / 1000.0) * w,
+                        (person_bbox[3] / 1000.0) * h
+                    ]
+                    
+                    object_box = [
+                        (object_bbox[0] / 1000.0) * w,
+                        (object_bbox[1] / 1000.0) * h,
+                        (object_bbox[2] / 1000.0) * w,
+                        (object_bbox[3] / 1000.0) * h
+                    ]
+                    
+                    pairs.append({
+                        'person_box': person_box,
+                        'object_box': object_box
+                    })
+        
+        return pairs
+        
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, IndexError):
+        return []
+
+
+def _parse_native_format(response_text, h, w):
+    """Parse legacy native Qwen3VL bbox format (fallback)."""
+    pairs = []
+    
+    # Pattern for native Qwen3VL format: <|box_start|>(x1,y1),(x2,y2)<|box_end|>
+    box_pattern = r'<\|box_start\|>\((\d+),(\d+)\),\((\d+),(\d+)\)<\|box_end\|>'
+    
+    # Find all box matches
+    box_matches = list(re.finditer(box_pattern, response_text))
+    
+    # Group boxes into pairs (person, object)
+    for i in range(0, len(box_matches), 2):
+        if i + 1 < len(box_matches):
+            # First match is person, second is object
+            person_match = box_matches[i]
+            object_match = box_matches[i + 1]
             
-            # Extract coordinates (in [0, 1000] format)
+            # Extract coordinates (in [0, 1000] format from Qwen3VL)
             person_coords = person_match.groups()
             object_coords = object_match.groups()
             
@@ -228,57 +472,67 @@ def match_pairs_greedy(pred_pairs, gt_pairs, iou_threshold=0.5):
 
 def load_groma_qwen_model(model_name, base_model_name=None, gpu_id=0):
     """
-    Load GromaQwenModel and processor.
+    Load Groma Qwen model with auto-detection for V2 vs V3.
     
     Returns:
-        model, processor, tokenizer
+        model: GromaQwenModel (V2) or GromaQwenInteractionModel (V3)
+        processor: Qwen processor
+        tokenizer: Tokenizer
+        is_v3: Boolean indicating if this is a V3 model
     """
     model_name = os.path.expanduser(model_name)
     
-    print("="*80)
-    print(f"Loading Groma-Qwen Model from {model_name}")
-    print("="*80)
+    print("=" * 80)
+    print(f"[GROMA-QWEN V3] Loading model from {model_name}")
+    print("=" * 80)
 
-    # 1. Load config
-    print(f"\n1. Loading config from {model_name}...")
-    config = GromaQwenConfig.from_pretrained(model_name, trust_remote_code=True)
-    print(f"   ✓ Config loaded successfully")
-    print(f"   - Model type: {config.model_type}")
-    print(f"   - New tokens: {config.num_new_token}")
+    # Auto-detect model type from config.json
+    config_path = os.path.join(model_name, "config.json")
+    is_v3 = False
+    
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            config_dict = json.load(f)
+        model_type = config_dict.get("model_type", "groma_qwen")
+        is_v3 = model_type == "groma_qwen_interaction"
+        print(f"✓ Detected model_type: {model_type}")
+    else:
+        print(f"! config.json not found, assuming V2 model")
+    
+    # Load appropriate config and model class
+    if is_v3:
+        print(f"✓ Loading as V3 (Interaction Token) model")
+        config = GromaQwenInteractionConfig.from_pretrained(model_name, trust_remote_code=True)
+        model_class = GromaQwenInteractionModel
+    else:
+        print(f"✓ Loading as V2 (Standard) model")
+        config = GromaQwenConfig.from_pretrained(model_name, trust_remote_code=True)
+        model_class = GromaQwenModel
+    
+    print(f"✓ Config loaded (model_type: {config.model_type})")
 
-    # 2. Load Processor
-    print(f"\n2. Loading processor...")
+    # Load Processor
     try:
         processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-        print(f"   ✓ Processor loaded from checkpoint")
+        print(f"✓ Processor loaded from checkpoint")
     except Exception as e:
-        print(f"   ! Could not load full processor from checkpoint: {e}")
+        print(f"! Could not load from checkpoint: {e}")
         if base_model_name:
-            print(f"   Loading from base model: {base_model_name}...")
             processor = AutoProcessor.from_pretrained(base_model_name, trust_remote_code=True)
-            print(f"   ✓ Processor loaded from base model")
+            print(f"✓ Processor loaded from base model")
         else:
             raise
 
-    # Get tokenizer
-    tokenizer = processor if hasattr(processor, 'vocab_size') else processor.tokenizer
-    print(f"   - Tokenizer vocab size: {tokenizer.vocab_size}")
+    tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
 
-    # Check if special tokens exist, if not add them
-    test_token = '<region>'
-    test_id = tokenizer.convert_tokens_to_ids(test_token)
-    if test_id == tokenizer.unk_token_id or test_id is None:
-        print(f"   ! Special tokens not found, adding them...")
-        num_added = tokenizer.add_tokens(
-            list(DEFAULT_TOKENS.values()) + REGION_IDX_TOKENS,
-            special_tokens=True
-        )
-        print(f"   ✓ Added {num_added} special tokens")
-    else:
-        print(f"   ✓ Special tokens already present (e.g., {test_token} -> {test_id})")
+    # Verify native bbox tokens
+    box_start_id = tokenizer.convert_tokens_to_ids(BOX_START)
+    box_end_id = tokenizer.convert_tokens_to_ids(BOX_END)
+    print(f"✓ Native bbox tokens verified:")
+    print(f"  - {BOX_START}: {box_start_id}")
+    print(f"  - {BOX_END}: {box_end_id}")
 
-    # 3. Load Model
-    print(f"\n3. Loading GromaQwenModel weights...")
+    # Load Model
     disable_torch_init()
     
     if torch.cuda.is_available():
@@ -286,97 +540,66 @@ def load_groma_qwen_model(model_name, base_model_name=None, gpu_id=0):
         torch.cuda.set_device(gpu_id)
         device_map = {"": device}
         dtype = torch.bfloat16
-        print(f"   Using GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
+        print(f"✓ Using GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
     else:
         device = "cpu"
         device_map = {"": device}
         dtype = torch.float32
-        print(f"   CUDA not available, using CPU")
+        print("! Using CPU")
     
-    model = GromaQwenModel.from_pretrained(
+    model = model_class.from_pretrained(
         model_name,
         config=config,
         device_map=device_map,
         trust_remote_code=True,
         torch_dtype=dtype
     )
-    print(f"   ✓ Model loaded successfully")
-    print(f"   - Device: {next(model.parameters()).device}")
-    print(f"   - Dtype: {next(model.parameters()).dtype}")
-
-    # 4. Initialize special token IDs
-    print(f"\n4. Initializing special tokens...")
+    
     model.init_special_token_id(tokenizer)
-    print(f"   ✓ Special tokens initialized")
-    print(f"   - Region token ID: {model.reg_token_id}")
-
     model.eval()
     
-    # Handle processor image_processor if missing
-    if not hasattr(processor, 'image_processor'):
-        print(f"   ! Processor doesn't have image_processor, loading full processor...")
-        qwen_base_models = [
-            "Groma/checkpoints/Qwen3-VL-8B-Instruct",
-            base_model_name if base_model_name else "checkpoints/groma-qwen-stage3-hoi",
-            "checkpoints/Qwen3-VL-8B-Instruct",
-        ]
-
-        full_processor = None
-        for base_model in qwen_base_models:
-            try:
-                print(f"   Trying {base_model}...")
-                full_processor = AutoProcessor.from_pretrained(base_model, trust_remote_code=True)
-                if hasattr(full_processor, 'image_processor'):
-                    print(f"   ✓ Loaded full processor from {base_model}")
-                    break
-            except Exception as e:
-                print(f"   ! Failed to load from {base_model}: {e}")
-
-        if full_processor is None or not hasattr(full_processor, 'image_processor'):
-            raise RuntimeError("Could not find a processor with image_processor.")
-
-        class CombinedProcessor:
-            def __init__(self, tokenizer, base_processor):
-                self.tokenizer = tokenizer
-                self.image_processor = base_processor.image_processor
-                self._base_processor = base_processor
-
-            def apply_chat_template(self, *args, **kwargs):
-                return self._base_processor.apply_chat_template(*args, **kwargs)
-
-            def __call__(self, *args, **kwargs):
-                return self._base_processor(*args, **kwargs)
-
-            def batch_decode(self, *args, **kwargs):
-                return self.tokenizer.batch_decode(*args, **kwargs)
-
-        processor = CombinedProcessor(tokenizer, full_processor)
-        print(f"   ✓ Combined processor created")
-
-    return model, processor, tokenizer
+    version_str = "V3 (Interaction Token)" if is_v3 else "V2 (Standard)"
+    print(f"✓ Model loaded successfully as {version_str}")
+    
+    return model, processor, tokenizer, is_v3
 
 
 def build_grounding_prompt(action, object_category):
     """
-    Build prompt for grounding task.
+    Build prompt for grounding task using JSON format (Qwen3-VL aligned).
+    
+    Note: Grounding task has no input bounding boxes - the model predicts them.
+    
+    Args:
+        action: Action verb (e.g., "sitting on")
+        object_category: Object category (e.g., "bench")
     
     Returns:
-        Prompt text string
+        Prompt text string requesting JSON format output
     """
-    prompt_text = f"[grounding] Identify the following person and objects in the image: person {action} {object_category} and the {object_category}"
+    prompt_text = (
+        f"Locate every person who is {action} {object_category} and the {object_category} "
+        f"they interact with in this image. For each person-object pair, output bbox "
+        f"coordinates in JSON format like: {{\"bbox_2d\": [x1, y1, x2, y2], \"label\": \"description\"}}"
+    )
     return prompt_text
 
 
-def run_groma_qwen_inference(model, processor, image_path, action, object_category, gpu_id=0):
+def run_groma_qwen_inference(model, processor, image_path, action, object_category, is_v3=False, gpu_id=0):
     """
     Run Groma Qwen inference for grounding task.
+    
+    Note: For grounding tasks, there are no input bounding boxes.
+    The model predicts the bounding boxes directly.
+    V2 and V3 models work the same for grounding.
 
     Args:
-        model: GromaQwenModel
+        model: GromaQwenModel (V2) or GromaQwenInteractionModel (V3)
         processor: Processor
         image_path: Path to image file
         action: Action verb
         object_category: Object category name
+        is_v3: Whether this is a V3 model (unused for grounding, kept for API consistency)
         gpu_id: GPU device ID
 
     Returns:
@@ -385,9 +608,8 @@ def run_groma_qwen_inference(model, processor, image_path, action, object_catego
     """
     # Load image
     image = Image.open(image_path).convert('RGB')
-    img_width, img_height = image.size
 
-    # Build prompt
+    # Build prompt (same for V2 and V3 - no input boxes for grounding)
     prompt_text = build_grounding_prompt(action, object_category)
 
     # Create messages for Qwen3-VL chat template
@@ -416,27 +638,17 @@ def run_groma_qwen_inference(model, processor, image_path, action, object_catego
     model_device = next(model.parameters()).device
     inputs = inputs.to(model_device)
 
-    # For grounding, we don't have specific refer_boxes, but we can use region_images
-    # For now, we'll pass empty region_images or None - the model should handle it
-    region_images = None
-
     # Get EOS token ID
     tokenizer = processor if hasattr(processor, 'vocab_size') else processor.tokenizer
-    eos_token_id = None
-    im_end_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-    if im_end_token_id != tokenizer.unk_token_id:
-        eos_token_id = im_end_token_id
-    else:
+    eos_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    if eos_token_id == tokenizer.unk_token_id:
         eos_token_id = getattr(tokenizer, 'eos_token_id', None)
-        if eos_token_id is None:
-            eos_token_id = tokenizer.convert_tokens_to_ids("</s>")
 
-    # Generate
+    # Generate - no region_images needed for grounding (model generates boxes)
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs,
-            region_images=region_images,
-            max_new_tokens=200,  # Allow for multiple pairs
+            max_new_tokens=300,  # Allow for multiple pairs
             use_cache=True,
             eos_token_id=eos_token_id,
             pad_token_id=eos_token_id,
@@ -445,7 +657,7 @@ def run_groma_qwen_inference(model, processor, image_path, action, object_catego
 
     # Decode response
     generated_ids_trimmed = [
-        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
     ]
     
     output_text = processor.batch_decode(
@@ -458,10 +670,14 @@ def run_groma_qwen_inference(model, processor, image_path, action, object_catego
 def eval_model(args):
     """Main evaluation function"""
 
+    # Determine dataset name from annotation file
+    dataset_name = "HICO-DET" if "hico" in args.ann_file.lower() else "SWIG-HOI"
+
     print("=" * 80)
-    print("SWIG-HOI Grounding Evaluation (Groma Qwen3VL)")
+    print(f"[GROMA-QWEN V3] {dataset_name} Grounding Evaluation")
     print("=" * 80)
     print(f"Model:       {args.model_name}")
+    print(f"Base Model:  {args.base_model_name}")
     print(f"Annotation:  {args.ann_file}")
     print(f"Images:      {args.img_prefix}")
     print(f"Output:      {args.result_file}")
@@ -480,13 +696,6 @@ def eval_model(args):
     elif args.device.isdigit():
         gpu_id = int(args.device)
 
-    # Load Groma Qwen model
-    model, processor, tokenizer = load_groma_qwen_model(
-        args.model_name,
-        args.base_model_name,
-        gpu_id
-    )
-
     # Initialize Weights & Biases
     use_wandb = WANDB_AVAILABLE and args.wandb
     if use_wandb:
@@ -495,25 +704,37 @@ def eval_model(args):
             wandb.login()
             wandb.init(
                 project=args.wandb_project,
-                name=args.wandb_run_name or f"swig_ground_groma_qwen_{timestamp}",
+                name=args.wandb_run_name or f"groma_qwen_v3_ground_{dataset_name.lower()}_{timestamp}",
                 config={
                     "model": args.model_name,
-                    "dataset": "SWIG-HOI-Ground",
-                    "task": "multi_pair_grounding",
+                    "base_model": args.base_model_name,
+                    "dataset": dataset_name,
+                    "task": "grounding",
                     "max_images": args.max_images,
                     "timestamp": timestamp,
                 },
-                tags=["swig", "grounding", "groma-qwen", "multi-pair"]
+                tags=["groma-qwen-v3", dataset_name.lower(), "grounding"]
             )
             print(f"✓ Weights & Biases initialized successfully!")
             print(f"  Run URL: {wandb.run.url}\n")
         except Exception as e:
-            print(f"⚠️  Warning: WandB initialization failed: {e}")
+            print(f"! Warning: WandB initialization failed: {e}")
             print(f"  Continuing evaluation without WandB logging...\n")
             use_wandb = False
 
+    # Load Groma Qwen model with auto-detection
+    model, processor, tokenizer, is_v3 = load_groma_qwen_model(
+        args.model_name,
+        args.base_model_name,
+        gpu_id
+    )
+    
+    version_str = "V3 (Interaction Token)" if is_v3 else "V2 (Standard)"
+    print(f"\n✓ Model loaded as: {version_str}")
+    print("  Note: Grounding task does not use interaction token (no input boxes)")
+
     # Load annotation file
-    print(f"Loading annotations from: {args.ann_file}")
+    print(f"\nLoading annotations from: {args.ann_file}")
     with open(args.ann_file, 'r') as f:
         dataset_samples = json.load(f)
 
@@ -526,7 +747,6 @@ def eval_model(args):
 
     print(f"\nDataset: {len(dataset_samples)} samples")
     print(f"Each sample = one (action, object) combination")
-    print("Note: This dataset includes person-person interactions")
     print("=" * 80)
 
     # Evaluation metrics at different IoU thresholds
@@ -615,7 +835,7 @@ def eval_model(args):
 
         # Run Groma Qwen inference
         output_text, image = run_groma_qwen_inference(
-            model, processor, img_path, action, object_category, gpu_id
+            model, processor, img_path, action, object_category, is_v3, gpu_id
         )
 
         if show_verbose:
@@ -623,7 +843,7 @@ def eval_model(args):
             print(f"  Response: {output_text[:200]}...")
 
         # Parse predicted pairs
-        pred_pairs = parse_groma_qwen_grounding_response(output_text, img_shape)
+        pred_pairs = parse_grounding_response(output_text, img_shape)
 
         if show_verbose:
             print(f"  Predicted pairs: {len(pred_pairs)}")
@@ -643,9 +863,12 @@ def eval_model(args):
             'num_pred_pairs': len(pred_pairs),
             'prompt': prompt_text,
             'generated_text': output_text,
-            'matches_per_threshold': {}
+            'matches_per_threshold': {},
+            'model_version': 'v3' if is_v3 else 'v2'
         }
 
+        matched_gt_indices_05 = set()  # Initialize for visualization
+        
         for iou_thr in iou_thresholds_ar:
             matches, unmatched_preds, unmatched_gts = match_pairs_greedy(
                 pred_pairs, gt_pairs, iou_threshold=iou_thr
@@ -675,11 +898,29 @@ def eval_model(args):
 
             if iou_thr == 0.5:
                 action_stats[action]['matched_pairs_05'] += len(matches)
+                matched_gt_indices_05 = matched_gt_indices  # Save for visualization
 
                 if show_verbose:
                     print(f"  Matched @ IoU=0.5: {len(matches)}/{len(gt_pairs)}")
 
         per_sample_results.append(sample_result)
+        
+        # Save visualization if verbose mode
+        if show_verbose and viz_dir:
+            try:
+                viz_filename = f"{idx+1:04d}_{os.path.splitext(file_name)[0]}_{action.replace(' ', '_')}_{object_category.replace(' ', '_')}.jpg"
+                viz_path = os.path.join(viz_dir, viz_filename)
+                visualize_grounding_result(
+                    image=image,
+                    gt_pairs=gt_pairs,
+                    pred_pairs=pred_pairs,
+                    action=action,
+                    object_category=object_category,
+                    output_path=viz_path,
+                    matched_indices=matched_gt_indices_05
+                )
+            except Exception as e:
+                print(f"  Warning: Could not save visualization: {e}")
 
         # Log per-sample metrics to WandB
         if use_wandb:
@@ -695,7 +936,8 @@ def eval_model(args):
 
     # Compute Average Recall (AR) metrics
     print("\n" + "=" * 80)
-    print("SWIG-HOI Grounding Evaluation Results (Groma Qwen3VL)")
+    print(f"[GROMA-QWEN V3] {dataset_name} Grounding Evaluation Results")
+    print(f"Model Version: {version_str}")
     print("=" * 80)
 
     # Compute recalls at all IoU thresholds
@@ -752,7 +994,8 @@ def eval_model(args):
         "ARm": ar_medium,
         "ARl": ar_large,
         "AR@0.5": ar_50,
-        "AR@0.75": ar_75
+        "AR@0.75": ar_75,
+        "model_version": "v3" if is_v3 else "v2"
     }
 
     print(f"\n{'Metric':<12} {'Value':>9}  {'Description':<50}")
@@ -789,6 +1032,11 @@ def eval_model(args):
         with open(per_image_file, 'w') as f:
             json.dump(per_sample_results, f, indent=2)
         print(f"✓ Per-image results saved to: {per_image_file}")
+        
+        # Count visualizations
+        if viz_dir and os.path.exists(viz_dir):
+            num_viz = len([f for f in os.listdir(viz_dir) if f.endswith('.jpg')])
+            print(f"✓ Visualizations saved to: {viz_dir}/ ({num_viz} images)")
 
     # Log final metrics to WandB
     if use_wandb:
@@ -799,30 +1047,55 @@ def eval_model(args):
             'ARs': metrics['ARs'],
             'ARm': metrics['ARm'],
             'ARl': metrics['ARl'],
+            'model_version': 'v3' if is_v3 else 'v2'
         })
+        
+        # Save artifacts
+        wandb.save(args.result_file)
+        wandb.save(metrics_file)
+        wandb.save(action_stats_file)
+        
+        # Create action performance table
+        action_table_data = []
+        for action, stats in sorted(action_stats_dict.items(), key=lambda x: x[1]['total_gt_pairs'], reverse=True)[:20]:
+            recall = stats['matched_pairs_05'] / stats['total_gt_pairs'] if stats['total_gt_pairs'] > 0 else 0.0
+            action_table_data.append([
+                action,
+                stats['total_samples'],
+                stats['total_gt_pairs'],
+                stats['matched_pairs_05'],
+                f"{recall:.1%}"
+            ])
+        
+        wandb.log({
+            "action_performance_table": wandb.Table(
+                columns=["Action", "Samples", "GT Pairs", "Matched@0.5", "Recall@0.5"],
+                data=action_table_data
+            )
+        })
+        
         wandb.finish()
+        print("✓ W&B logging complete")
 
     print("\n" + "=" * 80)
     print("Evaluation complete!")
-    print("=" * 80)
-    print("Note: This dataset includes person-person interactions")
     print("=" * 80)
 
     return metrics
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SWIG-HOI Grounding Evaluation with Groma Qwen3VL")
+    parser = argparse.ArgumentParser(description="HICO-DET/SWIG Grounding Evaluation with Groma Qwen V2/V3")
     parser.add_argument("--model-name", type=str, required=True,
-                        help="Path to Groma Qwen model checkpoint")
+                        help="Path to Groma Qwen V2 or V3 model checkpoint")
     parser.add_argument("--base-model-name", type=str, default=None,
                         help="Base model to load processor from (optional)")
     parser.add_argument("--device", type=str, default="0",
                         help="Device to use (GPU ID as integer or 'cuda:X')")
     parser.add_argument("--ann-file", type=str, required=True,
-                        help="Path to SWIG grounding annotation file")
+                        help="Path to grounding annotation file")
     parser.add_argument("--img-prefix", type=str, required=True,
-                        help="Path to SWIG images directory")
+                        help="Path to images directory")
     parser.add_argument("--result-file", type=str, required=True,
                         help="Output file for evaluation results")
     parser.add_argument("--max-images", type=int, default=None,
@@ -831,7 +1104,7 @@ if __name__ == "__main__":
                         help="Show detailed per-sample results")
     parser.add_argument("--wandb", action="store_true",
                         help="Enable Weights & Biases logging")
-    parser.add_argument("--wandb-project", type=str, default="swig-grounding-groma-qwen",
+    parser.add_argument("--wandb-project", type=str, default="groma-qwen-v3-grounding",
                         help="W&B project name")
     parser.add_argument("--wandb-run-name", type=str, default=None,
                         help="W&B run name (auto-generated if not provided)")

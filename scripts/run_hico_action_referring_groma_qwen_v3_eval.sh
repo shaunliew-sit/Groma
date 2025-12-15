@@ -1,49 +1,58 @@
 #!/bin/bash
 ################################################################################
-# [GROMA-QWEN V2] SWIG-HOI Action Referring Evaluation Script
-# Part of: Groma Qwen3VL Native Architecture (No DINOv2, No New Tokens)
+# [GROMA-QWEN V3] HICO-DET Action Referring Evaluation Script
+# Part of: Groma Qwen3VL with Interaction Token Architecture
 #
-# Evaluates Groma-Qwen V2 action prediction using METEOR and CIDEr metrics
+# Evaluates Groma-Qwen V2/V3 action prediction using METEOR and CIDEr metrics.
+# Auto-detects V2 vs V3 models from config.json.
 #
 # Task: Given (person, object) bounding boxes, predict the action connecting them
 # Metrics: METEOR (semantic similarity), CIDEr (corpus consensus), BLEU, ROUGE-L
 #
 # Usage:
-#   bash scripts/run_swig_action_referring_groma_qwen_v2_eval.sh [GPU] [MODEL] [OUTPUT_DIR]
+#   bash scripts/run_hico_action_referring_groma_qwen_v3_eval.sh [GPU] [MODEL] [BASE_MODEL] [OUTPUT_DIR]
 #
 # Examples:
-#   # Basic usage
-#   bash scripts/run_swig_action_referring_groma_qwen_v2_eval.sh 0
+#   # V3 model evaluation
+#   bash scripts/run_hico_action_referring_groma_qwen_v3_eval.sh 0 checkpoints/groma-qwen-v3-referring
 #
-#   # With custom model
-#   bash scripts/run_swig_action_referring_groma_qwen_v2_eval.sh 0 checkpoints/groma-qwen-v2-stage2
+#   # V2 model (auto-detected)
+#   bash scripts/run_hico_action_referring_groma_qwen_v3_eval.sh 0 checkpoints/groma-qwen-v2-stage2
 #
 #   # With debugging flags
-#   VERBOSE=1 bash scripts/run_swig_action_referring_groma_qwen_v2_eval.sh 0
-#   MAX_IMAGES=10 bash scripts/run_swig_action_referring_groma_qwen_v2_eval.sh 0
+#   VERBOSE=1 bash scripts/run_hico_action_referring_groma_qwen_v3_eval.sh 0
+#   MAX_IMAGES=10 bash scripts/run_hico_action_referring_groma_qwen_v3_eval.sh 0
+#   VERBOSE=1 MAX_IMAGES=10 bash scripts/run_hico_action_referring_groma_qwen_v3_eval.sh 0
 #
 #   # With W&B logging
-#   WANDB=1 VERBOSE=1 bash scripts/run_swig_action_referring_groma_qwen_v2_eval.sh 2
-#   WANDB=1 WANDB_PROJECT="my-project" bash scripts/run_swig_action_referring_groma_qwen_v2_eval.sh 0
+#   WANDB=1 VERBOSE=1 bash scripts/run_hico_action_referring_groma_qwen_v3_eval.sh 0
+#   WANDB=1 WANDB_PROJECT="my-project" bash scripts/run_hico_action_referring_groma_qwen_v3_eval.sh 0
 #
 # Environment Variables:
 #   VERBOSE=1             Show per-triplet results + visualizations with scores
 #   MAX_IMAGES=N          Limit to first N images (for quick testing)
 #   WANDB=1               Enable Weights & Biases logging
-#   WANDB_PROJECT=name    W&B project name (default: groma-qwen-v2-eval)
+#   WANDB_PROJECT=name    W&B project name (default: groma-qwen-v3-eval)
 #   WANDB_RUN_NAME=name   W&B run name (auto-generated if not provided)
+#
+# Output files:
+#   {output_dir}/hico_action_v3_{timestamp}.json              # Raw predictions
+#   {output_dir}/hico_action_v3_{timestamp}_per_triplet.json  # Per-triplet (VERBOSE)
+#   {output_dir}/hico_action_v3_{timestamp}_per_action.json   # Per-action (VERBOSE)
+#   {output_dir}/hico_action_v3_{timestamp}_metrics.json      # METEOR/CIDEr scores
+#   {output_dir}/hico_action_v3_{timestamp}.log               # Full log
 ################################################################################
 
 set -e  # Exit on error
 
 # Configuration with defaults
 GPU_ID="${1:-0}"
-MODEL_PATH="${2:-checkpoints/groma-qwen-v2-stage3-lora-referring}"
+MODEL_PATH="${2:-checkpoints/groma-qwen-v3-referring}"
 BASE_MODEL_PATH="${3:-checkpoints/Qwen3-VL-8B-Instruct}"
-SWIG_ROOT="../data/swig_hoi"
-BENCHMARK_ANN="groma_data/benchmarks/swig_action_referring_test.json"
-IMAGES_DIR="${SWIG_ROOT}/images_512"
-OUTPUT_DIR="${4:-results-groma-qwen/swig_action_referring_v2_lora_referring}"
+HICO_ROOT="../data/hico_20160224_det"
+BENCHMARK_ANN="groma_data/benchmarks/hico_action_referring_test.json"
+IMAGES_DIR="${HICO_ROOT}/images/test2015"
+OUTPUT_DIR="${4:-results-groma-qwen/hico_action_referring_v3}"
 
 # Set GPU
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
@@ -53,11 +62,11 @@ mkdir -p "$OUTPUT_DIR"
 
 # Timestamp for output files
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="$OUTPUT_DIR/swig_action_v2_${TIMESTAMP}.log"
-PRED_FILE="$OUTPUT_DIR/swig_action_v2_${TIMESTAMP}.json"
+LOG_FILE="$OUTPUT_DIR/hico_action_v3_${TIMESTAMP}.log"
+PRED_FILE="$OUTPUT_DIR/hico_action_v3_${TIMESTAMP}.json"
 
 echo "========================================================================"
-echo "[GROMA-QWEN V2] SWIG-HOI Action Referring Evaluation"
+echo "[GROMA-QWEN V3] HICO-DET Action Referring Evaluation"
 echo "========================================================================"
 echo "GPU:          $GPU_ID"
 echo "Model:        $MODEL_PATH"
@@ -66,6 +75,11 @@ echo "Annotation:   $BENCHMARK_ANN"
 echo "Images:       $IMAGES_DIR"
 echo "Output:       $OUTPUT_DIR"
 echo "Log file:     $LOG_FILE"
+echo ""
+echo "Features:"
+echo "  ✓ Auto-detects V2 vs V3 models"
+echo "  ✓ V3: Uses interaction token (union of person + object boxes)"
+echo "  ✓ V2: Standard 2-box format"
 echo "========================================================================"
 echo ""
 
@@ -83,6 +97,16 @@ fi
 if [ ! -d "$IMAGES_DIR" ]; then
     echo "ERROR: Images directory not found at $IMAGES_DIR"
     exit 1
+fi
+
+# Detect model type
+if [ -f "$MODEL_PATH/config.json" ]; then
+    MODEL_TYPE=$(grep -o '"model_type"[[:space:]]*:[[:space:]]*"[^"]*"' "$MODEL_PATH/config.json" | sed 's/.*"\([^"]*\)"$/\1/')
+    if [ "$MODEL_TYPE" = "groma_qwen_interaction" ]; then
+        echo "✓ Detected V3 model (interaction token enabled)"
+    else
+        echo "✓ Detected V2 model (standard 2-box format)"
+    fi
 fi
 
 # Count test images
@@ -126,8 +150,8 @@ echo ""
 echo "Starting evaluation..."
 echo ""
 
-# Run evaluation (using same script as HICO, just different annotation)
-python groma/eval/eval_hico_action_referring_groma_qwen_v2.py \
+# Run evaluation using V3 script (handles both V2 and V3)
+python groma/eval/eval_action_referring_groma_qwen_v3.py \
     --model-name "$MODEL_PATH" \
     --base-model-name "$BASE_MODEL_PATH" \
     --img-prefix "$IMAGES_DIR" \
@@ -148,6 +172,7 @@ if [ $? -eq 0 ]; then
     echo "========================================================================"
     echo "Results saved to:"
     echo "  Predictions:  $PRED_FILE"
+    echo "  Metrics:      ${PRED_FILE//.json/_metrics.json}"
     echo "  Log:          $LOG_FILE"
     echo ""
     if [ ! -z "$VERBOSE" ]; then

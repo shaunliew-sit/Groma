@@ -14,6 +14,7 @@ from groma.data.datasets.groma import GromaInstruct
 from groma.data.datasets.visual_genome import SingleRoundVG, MultiRoundsVG
 from groma.data.datasets.det_data import ClassAgnosticCoCo, ClassAgnosticSA1B
 from groma.data.datasets.groma_qwen import GromaInstructQwen
+from groma.data.datasets.groma_qwen_interaction import GromaInstructQwenInteraction
 
 
 def build_multi_datasets(dataset_cfg_file, tokenizer=None, **kwargs):
@@ -65,6 +66,16 @@ def build_dataset(dataset_cfg, tokenizer=None, **kwargs):
         dataset = GromaInstruct(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
     elif dataset_type == 'groma_qwen_instruct':
         dataset = GromaInstructQwen(**dataset_cfg, tokenizer=tokenizer, img_processor=kwargs['img_processor'], conv_temp=conv_temp)
+    elif dataset_type == 'groma_qwen_interaction_instruct':
+        # V3: Dataset with interaction token (union of person + object boxes)
+        use_interaction = dataset_cfg.pop('use_interaction', True)
+        dataset = GromaInstructQwenInteraction(
+            **dataset_cfg, 
+            tokenizer=tokenizer, 
+            img_processor=kwargs['img_processor'], 
+            conv_temp=conv_temp,
+            use_interaction=use_interaction
+        )
     else:
         raise NotImplementedError
 

@@ -21,10 +21,10 @@
 #   # With debugging flags
 #   VERBOSE=1 bash scripts/run_hico_action_referring_groma_qwen_v2_eval.sh 0
 #   MAX_IMAGES=10 bash scripts/run_hico_action_referring_groma_qwen_v2_eval.sh 0
-#   VERBOSE=1 MAX_IMAGES=10 bash scripts/run_hico_action_referring_groma_qwen_v2_eval.sh 4
+#   VERBOSE=1 MAX_IMAGES=10 bash scripts/run_hico_action_referring_groma_qwen_v2_eval.sh 0
 #
 #   # With W&B logging
-#   WANDB=1 VERBOSE=1 bash scripts/run_hico_action_referring_groma_qwen_v2_eval.sh 4
+#   WANDB=1 VERBOSE=1 bash scripts/run_hico_action_referring_groma_qwen_v2_eval.sh 2
 #   WANDB=1 WANDB_PROJECT="my-project" bash scripts/run_hico_action_referring_groma_qwen_v2_eval.sh 0
 #
 # Environment Variables:
@@ -46,12 +46,12 @@ set -e  # Exit on error
 
 # Configuration with defaults
 GPU_ID="${1:-0}"
-MODEL_PATH="${2:-checkpoints/groma-qwen-v2-stage2-combined}"
+MODEL_PATH="${2:-checkpoints/groma-qwen-v2-stage3-lora-referring}"
 BASE_MODEL_PATH="${3:-checkpoints/Qwen3-VL-8B-Instruct}"
 HICO_ROOT="../data/hico_20160224_det"
 BENCHMARK_ANN="groma_data/benchmarks/hico_action_referring_test.json"
 IMAGES_DIR="${HICO_ROOT}/images/test2015"
-OUTPUT_DIR="${4:-results-groma-qwen/hico_action_referring_v2_combined}"
+OUTPUT_DIR="${4:-results-groma-qwen/hico_action_referring_v2_lora_referring}"
 
 # Set GPU
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
